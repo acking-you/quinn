@@ -30,7 +30,7 @@ socket2 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 once_cell = { workspace = true }
-windows-sys = { workspace = true }
+windows-sys = { workspace = true, features = ["Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
 
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false, features = ["async_tokio"] }
