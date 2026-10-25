@@ -387,9 +387,10 @@ fn default_source_matches(socket: &UdpSockRef<'_>, transmit: &Transmit<'_>) -> b
         }
         let mut route = mem::zeroed();
         let mut source: WinSock::SOCKADDR_INET = mem::zeroed();
+        // Unlike setsockopt, getsockopt returns IP_UNICAST_IF in host order.
         if IpHelper::GetBestRoute2(
             ptr::null(),
-            u32::from_be(interface),
+            interface,
             ptr::null(),
             destination.as_ptr().cast(),
             0,
@@ -637,6 +638,23 @@ mod tests {
             contents: b"hello",
         };
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        assert!(default_source_matches(&(&socket).into(), &packet));
+        let destination = socket2::SockAddr::from(packet.destination);
+        let mut interface = 0_u32;
+        // SAFETY: destination is a valid IPv4 socket address and the output
+        // points to a writable interface index.
+        assert_eq!(
+            unsafe { IpHelper::GetBestInterfaceEx(destination.as_ptr().cast(), &mut interface) },
+            0
+        );
+        assert_ne!(interface, 0);
+        set_socket_option(
+            &socket,
+            WinSock::IPPROTO_IP,
+            WinSock::IP_UNICAST_IF,
+            interface.to_be(),
+        )
+        .unwrap();
         assert!(default_source_matches(&(&socket).into(), &packet));
         let mut different_source = packet.clone();
         different_source.src_ip = Some("192.0.2.1".parse().unwrap());
