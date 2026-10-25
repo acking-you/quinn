@@ -10,6 +10,7 @@ use std::{
 
 use libc::{c_int, c_uint};
 use once_cell::sync::Lazy;
+use windows_sys::Win32::NetworkManagement::IpHelper;
 use windows_sys::Win32::Networking::WinSock;
 
 use crate::{
@@ -323,6 +324,87 @@ impl UdpSocketState {
 }
 
 fn send(socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
+    send_with_source_fallback(
+        transmit,
+        |packet| send_msg(&socket, packet),
+        || default_source_matches(&socket, transmit),
+    )
+}
+
+fn send_with_source_fallback(
+    transmit: &Transmit<'_>,
+    mut send: impl FnMut(&Transmit<'_>) -> io::Result<()>,
+    default_source_matches: impl FnOnce() -> bool,
+) -> io::Result<()> {
+    match send(transmit) {
+        Err(error)
+            if error.raw_os_error() == Some(WinSock::WSAEINVAL)
+                && matches!(transmit.src_ip, Some(IpAddr::V4(_)))
+                && transmit.destination.is_ipv4()
+                && default_source_matches() =>
+        {
+            // Some Windows network stacks reject IP_PKTINFO on wildcard-bound
+            // sockets even when its source is the route's own local address.
+            // Omit only that redundant control message, never change the source
+            // requested by the caller or discard ECN/segmentation metadata.
+            let mut packet = transmit.clone();
+            packet.src_ip = None;
+            send(&packet)
+        }
+        result => result,
+    }
+}
+
+fn default_source_matches(socket: &UdpSockRef<'_>, transmit: &Transmit<'_>) -> bool {
+    let Some(IpAddr::V4(requested)) = transmit.src_ip else {
+        return false;
+    };
+    let Ok(local) = socket.0.local_addr() else {
+        return false;
+    };
+    let Some(local) = local.as_socket_ipv4() else {
+        return false;
+    };
+    if !local.ip().is_unspecified() {
+        return *local.ip() == requested;
+    }
+    let destination = socket2::SockAddr::from(transmit.destination);
+    // SAFETY: the destination is IPv4; all output pointers refer to writable,
+    // correctly sized storage. A socket's explicit interface selection must
+    // constrain the route lookup, just as it constrains the retry's send.
+    unsafe {
+        let mut interface = 0_u32;
+        let mut len = mem::size_of_val(&interface) as i32;
+        if WinSock::getsockopt(
+            socket.0.as_raw_socket() as _,
+            WinSock::IPPROTO_IP,
+            WinSock::IP_UNICAST_IF,
+            &mut interface as *mut _ as _,
+            &mut len,
+        ) != 0
+        {
+            return false;
+        }
+        let mut route = mem::zeroed();
+        let mut source: WinSock::SOCKADDR_INET = mem::zeroed();
+        if IpHelper::GetBestRoute2(
+            ptr::null(),
+            u32::from_be(interface),
+            ptr::null(),
+            destination.as_ptr().cast(),
+            0,
+            &mut route,
+            &mut source,
+        ) != 0
+        {
+            return false;
+        }
+        source.si_family == WinSock::AF_INET
+            && Ipv4Addr::from(u32::from_be(source.Ipv4.sin_addr.S_un.S_addr)) == requested
+    }
+}
+
+fn send_msg(socket: &UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
     // we cannot use [`socket2::sendmsg()`] and [`socket2::MsgHdr`] as we do not have access
     // to the inner field which holds the WSAMSG
     let mut ctrl_buf = cmsg::Aligned([0; CMSG_LEN]);
@@ -511,3 +593,76 @@ static MAX_GSO_SEGMENTS: Lazy<usize> = Lazy::new(|| {
         Err(_) => 1,
     }
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_source_retries_once_without_changing_the_datagram() {
+        let packet = Transmit {
+            destination: "192.0.2.2:4433".parse().unwrap(),
+            src_ip: Some("192.0.2.1".parse().unwrap()),
+            ecn: Some(EcnCodepoint::Ect0),
+            segment_size: Some(1200),
+            contents: &[7; 2400],
+        };
+        let mut calls = 0;
+        let error = send_with_source_fallback(
+            &packet,
+            |sent| {
+                calls += 1;
+                assert_eq!(sent.destination, packet.destination);
+                assert_eq!(sent.contents.as_ptr(), packet.contents.as_ptr());
+                assert_eq!(sent.contents.len(), packet.contents.len());
+                assert_eq!(sent.ecn, packet.ecn);
+                assert_eq!(sent.segment_size, packet.segment_size);
+                assert_eq!(sent.src_ip, if calls == 1 { packet.src_ip } else { None });
+                Err(io::Error::from_raw_os_error(WinSock::WSAEINVAL))
+            },
+            || true,
+        )
+        .unwrap_err();
+        assert_eq!(calls, 2, "a failed retry must not loop or report success");
+        assert_eq!(error.raw_os_error(), Some(WinSock::WSAEINVAL));
+    }
+
+    #[test]
+    fn fallback_requires_a_redundant_source_and_the_specific_error() {
+        let packet = Transmit {
+            destination: "127.0.0.1:4433".parse().unwrap(),
+            src_ip: Some(Ipv4Addr::LOCALHOST.into()),
+            ecn: None,
+            segment_size: None,
+            contents: b"hello",
+        };
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        assert!(default_source_matches(&(&socket).into(), &packet));
+        let mut different_source = packet.clone();
+        different_source.src_ip = Some("192.0.2.1".parse().unwrap());
+        assert!(!default_source_matches(
+            &(&socket).into(),
+            &different_source
+        ));
+
+        for (code, same_source) in [
+            (WinSock::WSAEINVAL, false),
+            (WinSock::WSAEWOULDBLOCK, true),
+            (WinSock::WSAENETUNREACH, true),
+        ] {
+            let mut calls = 0;
+            let error = send_with_source_fallback(
+                &packet,
+                |_| {
+                    calls += 1;
+                    Err(io::Error::from_raw_os_error(code))
+                },
+                || same_source,
+            )
+            .unwrap_err();
+            assert_eq!(calls, 1, "must preserve source selection and other errors");
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+        send_with_source_fallback(&packet, |_| Ok(()), || panic!("no lookup on success")).unwrap();
+    }
+}
