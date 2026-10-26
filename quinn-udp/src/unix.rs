@@ -593,6 +593,7 @@ pub(crate) fn send_single(
 
 /// Receive using the batched `recvmmsg` syscall
 #[cfg(recv_mmsg)]
+#[inline(always)] // Fixed batching should compile directly into the public receive entry point.
 fn recv_via_recvmmsg(
     io: SockRef<'_>,
     bufs: &mut [IoSliceMut<'_>],
