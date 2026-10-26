@@ -141,12 +141,15 @@ async fn client(
 
     // Wait for remaining streams to finish
     let _ = sem.acquire_many(opt.max_streams as u32).await.unwrap();
+    // Keep histogram aggregation outside the measured transfer duration.
+    let total_duration = start.elapsed();
 
     for result in results.lock().unwrap().drain(..) {
         match result {
-            Ok((upload_result, download_result)) => {
+            Ok((upload_result, download_result, request_result)) => {
                 stats.upload_stats.stream_finished(upload_result);
                 stats.download_stats.stream_finished(download_result);
+                stats.request_stats.stream_finished(request_result);
             }
             Err(e) => {
                 if first_error.is_none() {
@@ -156,8 +159,9 @@ async fn client(
         }
     }
 
-    stats.upload_stats.total_duration = start.elapsed();
-    stats.download_stats.total_duration = start.elapsed();
+    stats.upload_stats.total_duration = total_duration;
+    stats.download_stats.total_duration = total_duration;
+    stats.request_stats.total_duration = total_duration;
 
     // Explicit close of the connection, since handles can still be around due
     // to `Arc`ing them
@@ -179,7 +183,7 @@ async fn handle_client_stream(
     connection: Arc<quinn::Connection>,
     upload_size: u64,
     read_unordered: bool,
-) -> Result<(TransferResult, TransferResult)> {
+) -> Result<(TransferResult, TransferResult, TransferResult)> {
     let start = Instant::now();
 
     let (mut send_stream, mut recv_stream) = connection
@@ -191,17 +195,19 @@ async fn handle_client_stream(
 
     let upload_result = TransferResult::new(start.elapsed(), upload_size);
 
-    let start = Instant::now();
+    let download_start = Instant::now();
     let size = drain_stream(&mut recv_stream, read_unordered).await?;
-    let download_result = TransferResult::new(start.elapsed(), size as u64);
+    let download_result = TransferResult::new(download_start.elapsed(), size as u64);
+    let request_result = TransferResult::new(start.elapsed(), upload_size + size as u64);
 
-    Ok((upload_result, download_result))
+    Ok((upload_result, download_result, request_result))
 }
 
 #[derive(Default)]
 struct ClientStats {
     upload_stats: Stats,
     download_stats: Stats,
+    request_stats: Stats,
 }
 
 impl ClientStats {
@@ -216,5 +222,7 @@ impl ClientStats {
         if self.download_stats.total_size != 0 {
             self.download_stats.print("download");
         }
+
+        self.request_stats.print("request");
     }
 }

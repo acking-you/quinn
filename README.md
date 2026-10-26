@@ -29,8 +29,17 @@ families use standard UDP I/O. Unsupported calls disable batching; pending segme
 transmits fail rather than being merged into a single datagram. Validate additional
 kernel families before extending this allowlist.
 
+Receive capacity adapts to observed queue density. A new socket uses ordinary
+`recvmsg`; three consecutive successful receives establish a backlog and enable
+full batches. Four consecutive sparse batches return to ordinary receive. Draining
+a busy socket alone retains its batch size for the next burst. This uses existing
+receive results, with no timer, queue, separate probing syscall, or delay to fill a batch.
+Single-datagram sends already use `sendmsg`; only segmented sends use `sendmsg_x`.
+
 The `bulk` benchmark supports `--ipv4` and `--workers` to hold network and scheduling
-conditions constant. For example:
+conditions constant. It also reports whole-request durations, from opening a stream
+through receiving its response, and excludes histogram aggregation from throughput
+timing. For example:
 
 ```sh
 cargo run --release -p bench --bin bulk --features quinn/fast-apple-datapath -- \
