@@ -29,6 +29,12 @@ are zero-sized; only adaptive receive stores a load hint. Const-generic receive 
 and static dispatch add no trait objects, allocations, packet queues, or readiness probes.
 The public socket API and ownership remain unchanged.
 
+Coverage runs the workspace tests on Linux, macOS, and Windows and saves each LCOV
+report as a required GitHub Actions artifact. To additionally publish to Codecov,
+activate the fork there and set the GitHub Actions repository variable `CODECOV_ENABLED`
+to `true`. Uploads use GitHub OIDC and fail CI on errors; no long-lived upload token
+is required. Unconfigured forks still generate and retain all three coverage reports.
+
 | Platform | Send | Receive |
 | --- | --- | --- |
 | Linux / Android | `sendmsg` with GSO when supported | `recvmmsg`, with GRO when supported |
