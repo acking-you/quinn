@@ -17,7 +17,8 @@ default = ["tracing", "tracing-log"]
 # Configure `tracing` to log events via `log` if no `tracing` subscriber exists.
 tracing-log = ["tracing/log"]
 log = ["dep:log"]
-# Support private Apple APIs to send multiple packets in a single syscall.
+# Use private Apple APIs to batch datagrams on validated macOS kernels.
+# Other kernels retain the standard sendmsg/recvmsg path.
 fast-apple-datapath = []
 
 [dependencies]

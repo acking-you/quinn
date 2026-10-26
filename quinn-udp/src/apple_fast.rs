@@ -13,15 +13,49 @@ use crate::{
     imp::{BATCH_SIZE, IpTosTy, decode_recv, recv_single, retry_if_interrupted, send_single},
 };
 
+/// Automatic opt-in is limited to the Darwin ABI validated by this fork.
+#[cfg(target_os = "macos")]
+pub(crate) fn is_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut release = [0u8; 64];
+        let mut len = release.len();
+        // SAFETY: sysctl receives a valid name and a writable buffer of the supplied size.
+        let result = unsafe {
+            libc::sysctlbyname(
+                c"kern.osrelease".as_ptr(),
+                release.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        // Darwin 27 is validated on this fork. New kernel families require separate validation.
+        result == 0
+            && release.starts_with(b"27.")
+            && sendmsg_x_fn().is_some()
+            && recvmsg_x_fn().is_some()
+    })
+}
+
+fn unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::ENOTSUP | libc::EINVAL)
+    )
+}
+
 pub(crate) fn send(
     state: &UdpSocketState,
     io: SockRef<'_>,
     transmit: &Transmit<'_>,
 ) -> io::Result<()> {
-    if state.is_apple_fast_path_enabled() {
-        send_via_sendmsg_x(state, io, transmit)
-    } else {
-        send_single(state, io, transmit)
+    match transmit.effective_segment_size() {
+        None => send_single(state, io, transmit),
+        Some(0) => Err(io::ErrorKind::InvalidInput.into()),
+        Some(_) if state.is_apple_fast_path_enabled() => send_via_sendmsg_x(state, io, transmit),
+        // A transmit prepared before batching was disabled must not be merged into one datagram.
+        Some(_) => Err(io::Error::from_raw_os_error(libc::EMSGSIZE)),
     }
 }
 
@@ -37,7 +71,9 @@ fn send_via_sendmsg_x(
     let addr = socket2::SockAddr::from(transmit.destination);
     let segment_size = transmit.segment_size.unwrap_or(transmit.contents.len());
     let mut cnt = 0;
-    debug_assert!(transmit.contents.len().div_ceil(segment_size) <= BATCH_SIZE);
+    if transmit.contents.len().div_ceil(segment_size) > BATCH_SIZE {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
     for (i, chunk) in transmit
         .contents
         .chunks(segment_size)
@@ -64,9 +100,17 @@ fn send_via_sendmsg_x(
         cnt += 1;
     }
     let Some(sendmsg_x) = state.resolve_apple_fast_fn(sendmsg_x_fn) else {
-        return send_single(state, io, transmit);
+        return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
     };
-    retry_if_interrupted(|| unsafe { sendmsg_x(io.as_raw_fd(), hdrs.as_ptr(), cnt as u32, 0) })?;
+    if let Err(error) =
+        retry_if_interrupted(|| unsafe { sendmsg_x(io.as_raw_fd(), hdrs.as_ptr(), cnt as u32, 0) })
+    {
+        if unsupported(&error) {
+            state.disable_apple_fast_path();
+            return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -166,9 +210,16 @@ pub(crate) fn recv_via_recvmsg_x(
     let Some(recvmsg_x) = state.resolve_apple_fast_fn(recvmsg_x_fn) else {
         return recv_single(io, bufs, meta);
     };
-    let msg_count = retry_if_interrupted(|| unsafe {
+    let msg_count = match retry_if_interrupted(|| unsafe {
         recvmsg_x(io.as_raw_fd(), hdrs.as_mut_ptr(), max_msg_count as _, 0)
-    })?;
+    }) {
+        Ok(count) => count,
+        Err(error) if unsupported(&error) => {
+            state.disable_apple_fast_path();
+            return recv_single(io, bufs, meta);
+        }
+        Err(error) => return Err(error),
+    };
     for i in 0..(msg_count as usize) {
         meta[i] = decode_recv(&names[i], &hdrs[i], hdrs[i].msg_datalen as usize)?;
     }
@@ -248,5 +299,46 @@ impl MsgHdr for msghdr_x {
 
     fn control_len(&self) -> usize {
         self.msg_controllen as _
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::UdpSocket, time::Duration};
+
+    use super::*;
+
+    #[test]
+    fn disabled_batching_preserves_datagram_boundaries() {
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let state = UdpSocketState::new((&sender).into()).unwrap();
+        state.disable_apple_fast_path();
+        let mut transmit = Transmit {
+            destination: receiver.local_addr().unwrap(),
+            ecn: None,
+            contents: b"abcd",
+            segment_size: Some(2),
+            src_ip: None,
+        };
+        assert_eq!(
+            state
+                .try_send((&sender).into(), &transmit)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EMSGSIZE),
+        );
+        transmit.contents = b"";
+        transmit.segment_size = None;
+        state.try_send((&sender).into(), &transmit).unwrap();
+        let mut bytes = [0; 32];
+        assert_eq!(receiver.recv_from(&mut bytes).unwrap().0, 0);
+        transmit.contents = b"single";
+        state.try_send((&sender).into(), &transmit).unwrap();
+        let (len, _) = receiver.recv_from(&mut bytes).unwrap();
+        assert_eq!(&bytes[..len], b"single");
     }
 }

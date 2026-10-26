@@ -15,6 +15,28 @@ The project was founded by [Dirkjan Ochtman](https://github.com/djc) and
 30 releases since then. If you're using Quinn in a commercial setting, please consider
 [sponsoring](https://opencollective.com/quinn-rs) the project.
 
+## Fork maintenance
+
+This fork is maintained on `dev`; `upstream` retains unmodified upstream history.
+It preserves the Windows IPv4 source-hint fix and uses `parking_lot` connection locks
+with panic poisoning. UDP senders wait for write readiness only after backpressure.
+`TokioRuntime::wrap_tokio_udp_socket` lets a protocol multiplexer share one Tokio socket
+and reactor registration while retaining one receiver.
+
+The opt-in `fast-apple-datapath` feature automatically enables private Darwin batching
+APIs only on validated Darwin 27 kernels when both symbols are present. Other kernel
+families use standard UDP I/O. Unsupported calls disable batching; pending segmented
+transmits fail rather than being merged into a single datagram. Validate additional
+kernel families before extending this allowlist.
+
+The `bulk` benchmark supports `--ipv4` and `--workers` to hold network and scheduling
+conditions constant. For example:
+
+```sh
+cargo run --release -p bench --bin bulk --features quinn/fast-apple-datapath -- \
+  --ipv4 --workers 2 --download-size 256M --streams 4
+```
+
 ## Features
 
 - Simultaneous client/server operation

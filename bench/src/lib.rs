@@ -1,6 +1,6 @@
 use std::{
     convert::TryInto,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::ParseIntError,
     str::FromStr,
     sync::Arc,
@@ -43,7 +43,14 @@ pub fn server_endpoint(
         let _guard = rt.enter();
         quinn::Endpoint::server(
             server_config,
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+            SocketAddr::new(
+                if opt.ipv4 {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                } else {
+                    IpAddr::V6(Ipv6Addr::LOCALHOST)
+                },
+                0,
+            ),
         )
         .unwrap()
     };
@@ -57,8 +64,7 @@ pub async fn connect_client(
     server_cert: CertificateDer<'_>,
     opt: Opt,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
-    let endpoint =
-        quinn::Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).unwrap();
+    let endpoint = quinn::Endpoint::client(SocketAddr::new(server_addr.ip(), 0)).unwrap();
 
     let mut roots = RootCertStore::empty();
     roots.add(server_cert)?;
@@ -145,8 +151,15 @@ pub async fn send_data_on_stream(stream: &mut quinn::SendStream, stream_size: u6
     Ok(())
 }
 
-pub fn rt() -> Runtime {
-    Builder::new_current_thread().enable_all().build().unwrap()
+pub fn rt(workers: usize) -> Runtime {
+    let mut builder = if workers == 0 {
+        Builder::new_current_thread()
+    } else {
+        let mut builder = Builder::new_multi_thread();
+        builder.worker_threads(workers);
+        builder
+    };
+    builder.enable_all().build().unwrap()
 }
 
 pub fn transport_config(opt: &Opt) -> quinn::TransportConfig {
@@ -166,6 +179,12 @@ pub fn transport_config(opt: &Opt) -> quinn::TransportConfig {
 #[derive(Parser, Debug, Clone, Copy)]
 #[clap(name = "bulk")]
 pub struct Opt {
+    /// Use IPv4 loopback instead of IPv6 loopback.
+    #[clap(long)]
+    pub ipv4: bool,
+    /// Worker threads per endpoint; zero uses a current-thread runtime.
+    #[clap(long, default_value = "0")]
+    pub workers: usize,
     /// The total number of clients which should be created
     #[clap(long = "clients", short = 'c', default_value = "1")]
     pub clients: usize,

@@ -17,7 +17,7 @@ impl Stats {
 
         self.stream_stats
             .duration_hist
-            .record(stream_result.duration.as_millis() as u64)
+            .record(stream_result.duration.as_micros() as u64)
             .unwrap();
         self.stream_stats
             .throughput_hist
@@ -45,7 +45,7 @@ impl Stats {
                 " {} │ {:7.2} MiB/s │ {:>9.2?}",
                 label,
                 get_metric(&self.stream_stats.throughput_hist) as f64 / 1024.0 / 1024.0,
-                Duration::from_millis(get_metric(&self.stream_stats.duration_hist))
+                Duration::from_micros(get_metric(&self.stream_stats.duration_hist))
             );
         };
 
@@ -54,6 +54,7 @@ impl Stats {
         print_metric("P10 ", |hist| hist.value_at_quantile(0.10));
         print_metric("P50 ", |hist| hist.value_at_quantile(0.50));
         print_metric("P90 ", |hist| hist.value_at_quantile(0.90));
+        print_metric("P99 ", |hist| hist.value_at_quantile(0.99));
         print_metric("P100", |hist| hist.value_at_quantile(1.00));
     }
 }

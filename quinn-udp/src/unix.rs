@@ -196,7 +196,7 @@ impl UdpSocketState {
         }
 
         let now = Instant::now();
-        Ok(Self {
+        let state = Self {
             last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
             max_gso_segments: AtomicUsize::new(gso::max_gso_segments(&*io)),
             gro_segments,
@@ -206,7 +206,13 @@ impl UdpSocketState {
             apple_fast_path: AtomicBool::new(false),
             #[cfg(apple)]
             send_buffer_size: AtomicUsize::new(io.send_buffer_size().unwrap_or(usize::MAX)),
-        })
+        };
+        #[cfg(all(apple_fast, target_os = "macos"))]
+        if super::apple_fast::is_supported() {
+            // SAFETY: the capability check permits only a validated Darwin ABI with both symbols.
+            unsafe { state.set_apple_fast_path() };
+        }
+        Ok(state)
     }
 
     /// Sends a [`Transmit`] on the given socket
@@ -461,7 +467,7 @@ impl UdpSocketState {
 
     /// Disables Apple's fast UDP datapath, reverting to `sendmsg`/`recvmsg`
     #[cfg(apple_fast)]
-    fn disable_apple_fast_path(&self) {
+    pub(crate) fn disable_apple_fast_path(&self) {
         self.apple_fast_path.store(false, Ordering::Relaxed);
         self.max_gso_segments.store(1, Ordering::Relaxed);
     }

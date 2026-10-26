@@ -168,29 +168,18 @@ where
     ) -> Poll<io::Result<()>> {
         let mut this = self.project();
         loop {
-            if this.writable_fut.is_none() {
-                this.writable_fut
-                    .set(Some((this.make_writable_fut_fn)(this.socket)));
+            if let Some(writable) = this.writable_fut.as_mut().as_pin_mut() {
+                let result = task::ready!(writable.poll(cx));
+                this.writable_fut.set(None);
+                result?;
             }
-            // We're forced to `unwrap` here because `Fut` may be `!Unpin`, which means we can't safely
-            // obtain an `&mut WritableFut` after storing it in `self.writable_fut` when `self` is already behind `Pin`,
-            // and if we didn't store it then we wouldn't be able to keep it alive between
-            // `poll_send` calls.
-            let result = task::ready!(this.writable_fut.as_mut().as_pin_mut().unwrap().poll(cx));
-
-            // Polling an arbitrary `Future` after it becomes ready is a logic error, so arrange for
-            // a new `Future` to be created on the next call.
-            this.writable_fut.set(None);
-
-            // If .writable() fails, propagate the error
-            result?;
 
             match this.socket.try_send(transmit) {
-                // We thought the socket was writable, but it wasn't, then retry so that either another
-                // `writable().await` call determines that the socket is indeed not writable and
-                // registers us for a wakeup, or the send succeeds if this really was just a
-                // transient failure.
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                // Register for readiness only after backpressure. Successful sends need no
+                // readiness future or waker registration.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => this
+                    .writable_fut
+                    .set(Some((this.make_writable_fut_fn)(this.socket))),
                 Err(e) => {
                     log_sendmsg_error(this.last_send_error, &e, transmit);
                     return Poll::Ready(Ok(()));
@@ -289,6 +278,10 @@ pub use smol::*;
 
 #[cfg(all(test, any(feature = "runtime-tokio", feature = "runtime-smol")))]
 mod tests {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::{future, task::Waker};
 
     use super::*;
@@ -309,6 +302,55 @@ mod tests {
 
         assert!(matches!(result, Poll::Ready(Ok(()))));
         assert!(sender.last_send_error.is_some());
+    }
+
+    #[test]
+    fn blocked_send_waits_and_reuses_sender_after_readiness() {
+        let (ready, wait) = ::tokio::sync::oneshot::channel::<()>();
+        let wait = Mutex::new(Some(wait));
+        let mut sender = Box::pin(UdpSenderHelper::new(
+            BackpressuredSocket(AtomicUsize::new(0)),
+            move |_: &BackpressuredSocket| {
+                let wait = wait.lock().unwrap().take().unwrap();
+                async move { wait.await.map_err(io::Error::other) }
+            },
+        ));
+        let transmit = Transmit {
+            destination: SocketAddr::from(([127, 0, 0, 1], 4433)),
+            ecn: None,
+            contents: &[],
+            segment_size: None,
+            src_ip: None,
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(sender.as_mut().poll_send(&transmit, &mut cx).is_pending());
+        assert!(sender.as_mut().poll_send(&transmit, &mut cx).is_pending());
+        assert_eq!(sender.socket.0.load(Ordering::Relaxed), 1);
+        ready.send(()).unwrap();
+        assert!(matches!(
+            sender.as_mut().poll_send(&transmit, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            sender.as_mut().poll_send(&transmit, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    struct BackpressuredSocket(AtomicUsize);
+
+    impl UdpSenderHelperSocket for BackpressuredSocket {
+        fn try_send(&self, _: &Transmit<'_>) -> io::Result<()> {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn max_transmit_segments(&self) -> usize {
+            1
+        }
     }
 
     #[derive(Debug)]

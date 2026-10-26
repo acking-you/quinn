@@ -4,160 +4,132 @@ use std::{
 };
 
 #[cfg(feature = "lock_tracking")]
-mod tracking {
-    use super::*;
-    use crate::{Duration, Instant};
-    use std::collections::VecDeque;
-    use tracing::warn;
+use std::collections::VecDeque;
+#[cfg(feature = "lock_tracking")]
+use tracing::warn;
 
-    #[derive(Debug)]
-    struct Inner<T> {
-        last_lock_owner: VecDeque<(&'static str, Duration)>,
-        value: T,
-    }
+#[cfg(feature = "lock_tracking")]
+use crate::{Duration, Instant};
 
-    /// A Mutex which optionally allows to track the time a lock was held and
-    /// emit warnings in case of excessive lock times
-    pub(crate) struct Mutex<T> {
-        inner: std::sync::Mutex<Inner<T>>,
-    }
+/// A compact mutex with panic poisoning and optional lock timing diagnostics.
+#[derive(Debug)]
+pub(crate) struct Mutex<T> {
+    inner: parking_lot::Mutex<Inner<T>>,
+}
 
-    impl<T: Debug> Debug for Mutex<T> {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            Debug::fmt(&self.inner, f)
+#[derive(Debug)]
+struct Inner<T> {
+    value: T,
+    poisoned: bool,
+    #[cfg(feature = "lock_tracking")]
+    last_lock_owner: VecDeque<(&'static str, Duration)>,
+}
+
+impl<T> Mutex<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(Inner {
+                value,
+                poisoned: false,
+                #[cfg(feature = "lock_tracking")]
+                last_lock_owner: VecDeque::new(),
+            }),
         }
     }
 
-    impl<T> Mutex<T> {
-        pub(crate) fn new(value: T) -> Self {
-            Self {
-                inner: std::sync::Mutex::new(Inner {
-                    last_lock_owner: VecDeque::new(),
-                    value,
-                }),
-            }
+    /// Acquires the lock, failing if an earlier panic may have left state inconsistent.
+    pub(crate) fn lock(&self, _purpose: &'static str) -> MutexGuard<'_, T> {
+        #[cfg(feature = "lock_tracking")]
+        let now = Instant::now();
+        let guard = self.inner.lock();
+        assert!(
+            !guard.poisoned,
+            "connection state poisoned by an earlier panic"
+        );
+        #[cfg(feature = "lock_tracking")]
+        let lock_time = Instant::now();
+        #[cfg(feature = "lock_tracking")]
+        if lock_time.duration_since(now) > Duration::from_millis(1) {
+            warn!(
+                "Locking the connection for {} took {:?}. Last owners: {:?}",
+                _purpose,
+                lock_time.duration_since(now),
+                guard.last_lock_owner
+            );
         }
-
-        /// Acquires the lock for a certain purpose
-        ///
-        /// The purpose will be recorded in the list of last lock owners
-        pub(crate) fn lock(&self, purpose: &'static str) -> MutexGuard<'_, T> {
-            // We don't bother dispatching through Runtime::now because they're pure performance
-            // diagnostics.
-            let now = Instant::now();
-            let guard = self.inner.lock().unwrap();
-
-            let lock_time = Instant::now();
-            let elapsed = lock_time.duration_since(now);
-
-            if elapsed > Duration::from_millis(1) {
-                warn!(
-                    "Locking the connection for {} took {:?}. Last owners: {:?}",
-                    purpose, elapsed, guard.last_lock_owner
-                );
-            }
-
-            MutexGuard {
-                guard,
-                start_time: lock_time,
-                purpose,
-            }
+        MutexGuard {
+            guard,
+            panicking: std::thread::panicking(),
+            #[cfg(feature = "lock_tracking")]
+            start_time: lock_time,
+            #[cfg(feature = "lock_tracking")]
+            purpose: _purpose,
         }
     }
+}
 
-    pub(crate) struct MutexGuard<'a, T> {
-        guard: std::sync::MutexGuard<'a, Inner<T>>,
-        start_time: Instant,
-        purpose: &'static str,
+pub(crate) struct MutexGuard<'a, T> {
+    guard: parking_lot::MutexGuard<'a, Inner<T>>,
+    panicking: bool,
+    #[cfg(feature = "lock_tracking")]
+    start_time: Instant,
+    #[cfg(feature = "lock_tracking")]
+    purpose: &'static str,
+}
+
+impl<T> Deref for MutexGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.guard.value
     }
+}
 
-    impl<T> Drop for MutexGuard<'_, T> {
-        fn drop(&mut self) {
-            if self.guard.last_lock_owner.len() == MAX_LOCK_OWNERS {
+impl<T> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard.value
+    }
+}
+
+impl<T> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.guard.poisoned |= !self.panicking && std::thread::panicking();
+        #[cfg(feature = "lock_tracking")]
+        {
+            if self.guard.last_lock_owner.len() == 20 {
                 self.guard.last_lock_owner.pop_back();
             }
-
             let duration = self.start_time.elapsed();
-
             if duration > Duration::from_millis(1) {
                 warn!(
                     "Utilizing the connection for {} took {:?}",
                     self.purpose, duration
                 );
             }
-
             self.guard
                 .last_lock_owner
                 .push_front((self.purpose, duration));
         }
     }
-
-    impl<T> Deref for MutexGuard<'_, T> {
-        type Target = T;
-
-        fn deref(&self) -> &Self::Target {
-            &self.guard.value
-        }
-    }
-
-    impl<T> DerefMut for MutexGuard<'_, T> {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.guard.value
-        }
-    }
-
-    const MAX_LOCK_OWNERS: usize = 20;
 }
 
-#[cfg(feature = "lock_tracking")]
-pub(crate) use tracking::Mutex;
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
-#[cfg(not(feature = "lock_tracking"))]
-mod non_tracking {
-    use super::*;
+    use super::Mutex;
 
-    /// A Mutex which optionally allows to track the time a lock was held and
-    /// emit warnings in case of excessive lock times
-    #[derive(Debug)]
-    pub(crate) struct Mutex<T> {
-        inner: std::sync::Mutex<T>,
-    }
-
-    impl<T> Mutex<T> {
-        pub(crate) fn new(value: T) -> Self {
-            Self {
-                inner: std::sync::Mutex::new(value),
-            }
-        }
-
-        /// Acquires the lock for a certain purpose
-        ///
-        /// The purpose will be recorded in the list of last lock owners
-        pub(crate) fn lock(&self, _purpose: &'static str) -> MutexGuard<'_, T> {
-            MutexGuard {
-                guard: self.inner.lock().unwrap(),
-            }
-        }
-    }
-
-    pub(crate) struct MutexGuard<'a, T> {
-        guard: std::sync::MutexGuard<'a, T>,
-    }
-
-    impl<T> Deref for MutexGuard<'_, T> {
-        type Target = T;
-
-        fn deref(&self) -> &Self::Target {
-            self.guard.deref()
-        }
-    }
-
-    impl<T> DerefMut for MutexGuard<'_, T> {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            self.guard.deref_mut()
-        }
+    #[test]
+    fn panic_poisoning_prevents_reusing_partial_state() {
+        let state = Mutex::new(0);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let mut guard = state.lock("modify");
+                *guard = 1;
+                panic!("interrupted state update");
+            }))
+            .is_err()
+        );
+        assert!(catch_unwind(AssertUnwindSafe(|| state.lock("reuse"))).is_err());
     }
 }
-
-#[cfg(not(feature = "lock_tracking"))]
-pub(crate) use non_tracking::Mutex;

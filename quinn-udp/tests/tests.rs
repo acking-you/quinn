@@ -222,7 +222,12 @@ fn ecn_v4_mapped_v6() {
 
 #[test]
 #[cfg_attr(
-    not(any(target_os = "linux", target_os = "windows", target_os = "android")),
+    not(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "android",
+        apple_fast
+    )),
     ignore
 )]
 fn gso() {
@@ -455,12 +460,7 @@ fn ip_to_v6_mapped(x: IpAddr) -> IpAddr {
     }
 }
 
-/// Test Apple fast datapath enable/disable functionality.
-///
-/// This test verifies that:
-/// 1. `max_gso_segments()` returns 1 by default (fast path disabled)
-/// 2. After calling `set_apple_fast_path()`, `max_gso_segments()` returns `BATCH_SIZE`
-/// 3. Send/recv still works correctly with the fast path enabled
+/// Exercise automatic activation and idempotent opt-in on validated Apple hosts.
 #[test]
 #[cfg(apple_fast)]
 fn apple_fast_datapath() {
@@ -471,19 +471,11 @@ fn apple_fast_datapath() {
     let send_state = UdpSocketState::new((&send).into()).unwrap();
     let recv_state = UdpSocketState::new((&recv).into()).unwrap();
 
-    // Initially, fast path should be disabled and max_gso_segments should be 1
-    assert!(
-        !send_state.is_apple_fast_path_enabled(),
-        "fast path should be disabled initially"
-    );
-    assert_eq!(
-        send_state.max_gso_segments(),
-        1,
-        "max_gso_segments should be 1 before enabling fast path"
-    );
+    if !send_state.is_apple_fast_path_enabled() {
+        return;
+    }
 
-    // Enable the fast path
-    // SAFETY: Assume that sendmsg_x/recvmsg_x are available on the macOS test host.
+    // SAFETY: automatic activation has already validated this kernel and both symbols.
     unsafe {
         send_state.set_apple_fast_path();
         recv_state.set_apple_fast_path();

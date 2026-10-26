@@ -18,6 +18,21 @@ use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSenderHelper, UdpSenderHelpe
 #[derive(Debug)]
 pub struct TokioRuntime;
 
+impl TokioRuntime {
+    /// Use an existing Tokio UDP socket as a Quinn socket.
+    ///
+    /// The caller may retain a handle for sending other protocols on the same port. Quinn must
+    /// remain the socket's only receiver, or datagrams may be consumed by the wrong reader.
+    pub fn wrap_tokio_udp_socket(
+        socket: Arc<tokio::net::UdpSocket>,
+    ) -> io::Result<Box<dyn AsyncUdpSocket>> {
+        Ok(Box::new(UdpSocket {
+            inner: Arc::new(udp::UdpSocketState::new((&*socket).into())?),
+            io: socket,
+        }))
+    }
+}
+
 impl Runtime for TokioRuntime {
     fn new_timer(&self, t: Instant) -> Pin<Box<dyn AsyncTimer>> {
         Box::pin(sleep_until(t.into()))
@@ -28,10 +43,8 @@ impl Runtime for TokioRuntime {
     }
 
     fn wrap_udp_socket(&self, sock: std::net::UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
-        Ok(Box::new(UdpSocket {
-            inner: Arc::new(udp::UdpSocketState::new((&sock).into())?),
-            io: Arc::new(tokio::net::UdpSocket::from_std(sock)?),
-        }))
+        sock.set_nonblocking(true)?;
+        Self::wrap_tokio_udp_socket(Arc::new(tokio::net::UdpSocket::from_std(sock)?))
     }
 
     fn now(&self) -> Instant {

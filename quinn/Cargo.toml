@@ -23,6 +23,8 @@ aws-lc-rs-fips = ["proto/aws-lc-rs-fips"]
 bloom = ["proto/bloom"]
 # Records how long locks are held, and warns if they are held >= 1ms
 lock_tracking = []
+# Opt in to batched UDP on validated macOS versions, using private Darwin APIs.
+fast-apple-datapath = ["udp/fast-apple-datapath"]
 # Provides `ClientConfig::with_platform_verifier()` convenience method
 platform-verifier = ["proto/platform-verifier"]
 # For backwards compatibility, `rustls` forwards to `rustls-ring`
@@ -56,6 +58,7 @@ bytes = { workspace = true }
 # Enables futures::io::{AsyncRead, AsyncWrite} support for streams
 futures-io = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
+parking_lot = { workspace = true }
 pin-project-lite = { workspace = true }
 proto = { package = "quinn-proto", path = "../quinn-proto", version = "0.12.0", default-features = false }
 rustls = { workspace = true, optional = true }

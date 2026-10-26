@@ -1969,6 +1969,7 @@ dependencies = [
  "crc",
  "directories-next",
  "futures-io",
+ "parking_lot",
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
