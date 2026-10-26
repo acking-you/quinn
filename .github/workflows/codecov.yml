@@ -6,6 +6,9 @@ on:
 
 jobs:
   coverage:
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -32,6 +35,6 @@ jobs:
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+          use_oidc: true
           files: lcov.info
           fail_ci_if_error: true
