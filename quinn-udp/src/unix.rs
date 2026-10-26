@@ -15,8 +15,9 @@ use std::{
 use socket2::SockRef;
 
 use super::{
-    EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, TransportError, UdpSockRef, cmsg,
-    log_sendmsg_error,
+    EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, TransportError, UdpSockRef,
+    batch::{DatagramIo, ReceivePolicy},
+    cmsg, log_sendmsg_error,
 };
 
 #[cfg(apple_fast)]
@@ -49,10 +50,7 @@ pub struct UdpSocketState {
     #[cfg(apple_fast)]
     apple_fast_path: AtomicBool,
 
-    /// Receive hint: 0..=2 count consecutive ordinary reads; 3..=6 select full batches.
-    /// Four sparse batches return from the full mode to ordinary receive.
-    #[cfg(apple_fast)]
-    apple_recv_state: AtomicUsize,
+    receive: <PlatformIo as DatagramIo>::Receive,
 
     /// Cached `SO_SNDBUF`.
     #[cfg(apple)]
@@ -209,8 +207,7 @@ impl UdpSocketState {
             sendmsg_einval: AtomicBool::new(false),
             #[cfg(apple_fast)]
             apple_fast_path: AtomicBool::new(false),
-            #[cfg(apple_fast)]
-            apple_recv_state: AtomicUsize::new(0),
+            receive: Default::default(),
             #[cfg(apple)]
             send_buffer_size: AtomicUsize::new(io.send_buffer_size().unwrap_or(usize::MAX)),
         };
@@ -235,7 +232,7 @@ impl UdpSocketState {
     /// instead.
     #[deprecated(note = "silences I/O errors; use `UdpSocketState::try_send() instead")]
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(self, socket.0, transmit) {
+        match PlatformIo::send(self, socket, transmit) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             // - EMSGSIZE is expected for MTU probes. Future work might be able to avoid
@@ -251,77 +248,16 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] on the given socket without any additional error handling
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        send(self, socket.0, transmit)
+        PlatformIo::send(self, socket, transmit)
     }
 
-    #[cfg(not(any(
-        apple,
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly",
-        target_os = "redox",
-        target_os = "hurd",
-        solarish
-    )))]
     pub fn recv(
         &self,
         socket: UdpSockRef<'_>,
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> io::Result<usize> {
-        recv_via_recvmmsg(socket.0, bufs, meta)
-    }
-
-    #[cfg(apple_fast)]
-    pub fn recv(
-        &self,
-        socket: UdpSockRef<'_>,
-        bufs: &mut [IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
-    ) -> io::Result<usize> {
-        if !self.is_apple_fast_path_enabled() {
-            return recv_single(socket.0, bufs, meta);
-        }
-        let hint = self.apple_recv_state.load(Ordering::Relaxed);
-        let result = if hint <= 2 || bufs.len() == 1 {
-            recv_single(socket.0, bufs, meta)
-        } else {
-            recv_via_recvmsg_x(self, socket.0, bufs, meta)
-        };
-        // Three consecutive successful ordinary reads establish a backlog. Four sparse
-        // batches return to ordinary receive, so isolated ACKs do not cause oscillation.
-        // Draining a busy socket alone does not predict the next burst. This uses only
-        // existing receive results: no timers, separate probing syscalls, or batching delay.
-        let next = match &result {
-            Ok(_) if hint < 2 => hint + 1,
-            Ok(count) if hint == 2 || *count > 1 => 6,
-            Ok(_) => hint - 1,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock && hint <= 2 => 0,
-            Err(_) => hint,
-        };
-        if next != hint {
-            // Only a performance hint: simultaneous readers may overwrite observations.
-            self.apple_recv_state.store(next, Ordering::Relaxed);
-        }
-        result
-    }
-
-    #[cfg(any(
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly",
-        target_os = "redox",
-        target_os = "hurd",
-        solarish,
-        apple_slow
-    ))]
-    pub fn recv(
-        &self,
-        socket: UdpSockRef<'_>,
-        bufs: &mut [IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
-    ) -> io::Result<usize> {
-        recv_single(socket.0, bufs, meta)
+        ReceivePolicy::<PlatformIo>::recv(&self.receive, self, socket, bufs, meta)
     }
 
     /// Enables asynchronous transport-layer error reception for this socket
@@ -656,15 +592,7 @@ pub(crate) fn send_single(
 }
 
 /// Receive using the batched `recvmmsg` syscall
-#[cfg(not(any(
-    apple,
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "dragonfly",
-    target_os = "redox",
-    target_os = "hurd",
-    solarish
-)))]
+#[cfg(recv_mmsg)]
 fn recv_via_recvmmsg(
     io: SockRef<'_>,
     bufs: &mut [IoSliceMut<'_>],
@@ -697,17 +625,6 @@ fn recv_via_recvmmsg(
     Ok(msg_count as usize)
 }
 
-#[cfg(any(
-    test,
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "dragonfly",
-    target_os = "redox",
-    target_os = "hurd",
-    solarish,
-    apple
-))]
-#[cfg_attr(apple_fast, allow(dead_code))] // Unused when apple_fast is enabled
 pub(crate) fn recv_single(
     io: SockRef<'_>,
     bufs: &mut [IoSliceMut<'_>],
@@ -977,12 +894,58 @@ pub(crate) fn decode_socket_addr(name: &libc::sockaddr_storage) -> io::Result<So
     }
 }
 
-#[cfg(not(apple_slow))]
-// Chosen somewhat arbitrarily; might benefit from additional tuning.
-pub(crate) const BATCH_SIZE: usize = 32;
+pub(crate) const BATCH_SIZE: usize = PlatformIo::BATCH_SIZE;
 
-#[cfg(apple_slow)]
-pub(crate) const BATCH_SIZE: usize = 1;
+/// The Unix syscall backend. Policy selection adds state only on the Apple fast path.
+struct PlatformIo;
+
+impl DatagramIo for PlatformIo {
+    #[cfg(recv_mmsg)]
+    type Receive = crate::batch::Batch;
+    #[cfg(apple_fast)]
+    type Receive = crate::batch::Adaptive;
+    #[cfg(not(any(recv_mmsg, apple_fast)))]
+    type Receive = crate::batch::Single;
+
+    const BATCH_SIZE: usize = if cfg!(any(recv_mmsg, apple_fast)) {
+        32
+    } else {
+        1
+    };
+
+    #[inline(always)]
+    fn send(
+        state: &UdpSocketState,
+        socket: UdpSockRef<'_>,
+        transmit: &Transmit<'_>,
+    ) -> io::Result<()> {
+        send(state, socket.0, transmit)
+    }
+
+    #[inline(always)]
+    fn recv<const BATCH: bool>(
+        _state: &UdpSocketState,
+        socket: UdpSockRef<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> io::Result<usize> {
+        if BATCH {
+            #[cfg(recv_mmsg)]
+            return recv_via_recvmmsg(socket.0, bufs, meta);
+            #[cfg(apple_fast)]
+            return recv_via_recvmsg_x(_state, socket.0, bufs, meta);
+        }
+        recv_single(socket.0, bufs, meta)
+    }
+}
+
+#[cfg(apple_fast)]
+impl crate::batch::AdaptiveIo for PlatformIo {
+    #[inline(always)]
+    fn batch_enabled(state: &UdpSocketState) -> bool {
+        state.is_apple_fast_path_enabled()
+    }
+}
 
 // On Apple platforms using the `sendmsg_x` call, UDP datagram segmentation is not
 // offloaded to the NIC or even the kernel, but instead done here in user space in
@@ -1105,7 +1068,6 @@ mod tests {
                 .kind(),
             io::ErrorKind::WouldBlock
         );
-        assert_eq!(state.apple_recv_state.load(Ordering::Relaxed), 0);
 
         for value in 0..16u8 {
             sender.send_to(&[value], address).unwrap();
@@ -1124,7 +1086,6 @@ mod tests {
             }
         }
         assert_eq!(received, (0..16).collect::<Vec<u8>>());
-        assert!(state.apple_recv_state.load(Ordering::Relaxed) > 2);
 
         // A drained burst retains batching until the next sparse receive.
         assert_eq!(
@@ -1134,7 +1095,6 @@ mod tests {
                 .kind(),
             io::ErrorKind::WouldBlock
         );
-        assert!(state.apple_recv_state.load(Ordering::Relaxed) > 2);
         for _ in 0..4 {
             sender.send_to(b"sparse", address).unwrap();
             wait_readable();
@@ -1146,7 +1106,21 @@ mod tests {
             );
             assert_eq!(&bufs[0][..meta[0].len], b"sparse");
         }
-        assert_eq!(state.apple_recv_state.load(Ordering::Relaxed), 2);
+        // Two queued packets distinguish ordinary receive from a batch without exposing
+        // the policy's internal counter to this test.
+        for _ in 0..2 {
+            sender.send_to(b"single", address).unwrap();
+        }
+        for _ in 0..2 {
+            wait_readable();
+            assert_eq!(
+                state
+                    .recv((&receiver).into(), &mut bufs, &mut meta)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(&bufs[0][..meta[0].len], b"single");
+        }
         assert_eq!(
             state
                 .recv((&receiver).into(), &mut bufs, &mut meta)
@@ -1154,7 +1128,6 @@ mod tests {
                 .kind(),
             io::ErrorKind::WouldBlock
         );
-        assert_eq!(state.apple_recv_state.load(Ordering::Relaxed), 0);
         // Empty UDP datagrams still count as received messages, not an idle socket.
         let send_state = UdpSocketState::new((&sender).into()).unwrap();
         send_state

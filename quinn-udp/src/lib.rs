@@ -50,6 +50,9 @@ use windows_sys::Win32::Networking::WinSock;
 #[cfg(apple_fast)]
 mod apple_fast;
 
+#[cfg(not(wasm_browser))]
+mod batch;
+
 #[cfg(any(unix, windows))]
 mod cmsg;
 
@@ -180,7 +183,7 @@ impl Transmit<'_> {
     /// This case is actually quite common when splitting up a prepared GSO batch
     /// again after GSO has been disabled because the last datagram in a GSO
     /// batch is allowed to be smaller than the segment size.
-    #[cfg_attr(apple_fast, allow(dead_code))] // Used by prepare_msg, which is unused when apple_fast
+    #[cfg(any(unix, windows))]
     fn effective_segment_size(&self) -> Option<usize> {
         match self.segment_size? {
             size if size >= self.contents.len() => None,
@@ -245,14 +248,14 @@ pub enum TransportErrorPayload {
 /// the Winsock error WSAEMSGSIZE (10040) via `GetLastError()`, which is
 /// distinct from the MSVCRT `errno.h` EMSGSIZE value of 115, which is
 /// never actually populated by socket operations).
-pub fn is_msg_size_err(err: &io::Error) -> bool {
+pub fn is_msg_size_err(_err: &io::Error) -> bool {
     #[cfg(unix)]
     {
-        err.raw_os_error() == Some(libc::EMSGSIZE)
+        _err.raw_os_error() == Some(libc::EMSGSIZE)
     }
     #[cfg(windows)]
     {
-        err.raw_os_error() == Some(WinSock::WSAEMSGSIZE)
+        _err.raw_os_error() == Some(WinSock::WSAEMSGSIZE)
     }
     #[cfg(not(any(unix, windows)))]
     {

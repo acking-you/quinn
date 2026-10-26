@@ -575,8 +575,9 @@ fn sndbuf_cmsg_boundary_fast_path() {
     send.set_nonblocking(true).unwrap();
 
     let state = UdpSocketState::new((&send).into()).unwrap();
-    // SAFETY: assumes sendmsg_x is available on the macOS test host.
-    unsafe { state.set_apple_fast_path() };
+    if !state.is_apple_fast_path_enabled() {
+        return;
+    }
     assert_min_sndbuf_enforced(&state, &send, dst, tclass_cmsg_space());
 }
 

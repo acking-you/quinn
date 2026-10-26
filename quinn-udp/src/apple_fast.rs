@@ -188,6 +188,9 @@ type SendmsgXFn =
     unsafe extern "C" fn(libc::c_int, *const msghdr_x, libc::c_uint, libc::c_int) -> isize;
 
 /// Receive using the fast `recvmsg_x` API
+// Keep the full message arrays off the ordinary receive path's stack, even after inlining
+// the statically selected policy and backend. Only busy receives need this frame.
+#[inline(never)]
 pub(crate) fn recv_via_recvmsg_x(
     state: &UdpSocketState,
     io: SockRef<'_>,

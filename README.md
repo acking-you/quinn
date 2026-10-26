@@ -23,13 +23,32 @@ with panic poisoning. UDP senders wait for write readiness only after backpressu
 `TokioRuntime::wrap_tokio_udp_socket` lets a protocol multiplexer share one Tokio socket
 and reactor registration while retaining one receiver.
 
+UDP mechanisms implement the internal `DatagramIo` trait. An associated `ReceivePolicy`
+selects single, native batched, or adaptive receives at compile time. Fixed policies
+are zero-sized; only adaptive receive stores a load hint. Const-generic receive calls
+and static dispatch add no trait objects, allocations, packet queues, or readiness probes.
+The public socket API and ownership remain unchanged.
+
+| Platform | Send | Receive |
+| --- | --- | --- |
+| Linux / Android | `sendmsg` with GSO when supported | `recvmmsg`, with GRO when supported |
+| Windows | `WSASendMsg` with USO when supported | Provider-specific `WSARecvMsg`; URO remains explicit opt-in |
+| macOS with validated fast path | `sendmsg` / segmented `sendmsg_x` | Adaptive `recvmsg` / `recvmsg_x` |
+| iOS and other Apple kernels by default | `sendmsg` | `recvmsg` |
+
+Windows URO is not enabled automatically because some drivers omit the segment metadata
+([upstream issue](https://github.com/quinn-rs/quinn/issues/2041)). Its existing
+`set_gro` API remains available for validated deployments. iOS is compiled through the
+same backend but is not included in the private-API validation allowlist. This abstraction
+does not establish a throughput improvement on unmeasured platforms.
+
 The opt-in `fast-apple-datapath` feature automatically enables private Darwin batching
-APIs only on validated Darwin 27 kernels when both symbols are present. Other kernel
-families use standard UDP I/O. Unsupported calls disable batching; pending segmented
+APIs only on macOS with validated Darwin 27 kernels when both symbols are present. Other
+systems use standard UDP I/O. Unsupported calls disable batching; pending segmented
 transmits fail rather than being merged into a single datagram. Validate additional
 kernel families before extending this allowlist.
 
-Receive capacity adapts to observed queue density. A new socket uses ordinary
+On that Apple fast path, receive capacity adapts to observed queue density. A new socket uses ordinary
 `recvmsg`; three consecutive successful receives establish a backlog and enable
 full batches. Four consecutive sparse batches return to ordinary receive. Draining
 a busy socket alone retains its batch size for the next burst. This uses existing

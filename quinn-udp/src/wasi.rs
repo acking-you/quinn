@@ -5,6 +5,8 @@ use std::{
     time::Instant,
 };
 
+use crate::batch::{DatagramIo, ReceivePolicy};
+
 use super::{IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef, log_sendmsg_error};
 
 /// UDP socket interface for WASI
@@ -13,6 +15,7 @@ use super::{IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef, log_sendmsg_e
 #[derive(Debug)]
 pub struct UdpSocketState {
     last_send_error: Mutex<Instant>,
+    receive: <PlatformIo as DatagramIo>::Receive,
 }
 
 impl UdpSocketState {
@@ -22,6 +25,7 @@ impl UdpSocketState {
         let now = Instant::now();
         Ok(Self {
             last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
+            receive: Default::default(),
         })
     }
 
@@ -38,7 +42,7 @@ impl UdpSocketState {
     /// instead.
     #[deprecated(note = "silences I/O errors; use `UdpSocketState::try_send() instead")]
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(socket, transmit) {
+        match PlatformIo::send(self, socket, transmit) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             Err(e) => {
@@ -51,7 +55,7 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] on the given socket without any additional error handling.
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        send(socket, transmit)
+        PlatformIo::send(self, socket, transmit)
     }
 
     pub fn recv(
@@ -60,21 +64,7 @@ impl UdpSocketState {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> io::Result<usize> {
-        // `wasi:sockets` has no vectored receive, and `BATCH_SIZE` is 1 regardless.
-        // Safety: `MaybeUninit<u8>` shares the layout of `u8`, and `recv_from` writes only
-        // the prefix it reports as filled.
-        let buf = unsafe { &mut *(&mut *bufs[0] as *mut [u8] as *mut [MaybeUninit<u8>]) };
-        let (len, addr) = socket.0.recv_from(buf)?;
-        meta[0] = RecvMeta {
-            len,
-            stride: len,
-            addr: addr.as_socket().unwrap(),
-            ecn: None,
-            dst_ip: None,
-            interface_index: None,
-            timestamp: None,
-        };
-        Ok(1)
+        ReceivePolicy::<PlatformIo>::recv(&self.receive, self, socket, bufs, meta)
     }
 
     #[inline]
@@ -125,4 +115,44 @@ fn send(socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) const BATCH_SIZE: usize = 1;
+pub(crate) const BATCH_SIZE: usize = PlatformIo::BATCH_SIZE;
+
+struct PlatformIo;
+
+impl DatagramIo for PlatformIo {
+    type Receive = crate::batch::Single;
+    const BATCH_SIZE: usize = 1;
+
+    #[inline(always)]
+    fn send(
+        _state: &UdpSocketState,
+        socket: UdpSockRef<'_>,
+        transmit: &Transmit<'_>,
+    ) -> io::Result<()> {
+        send(socket, transmit)
+    }
+
+    #[inline(always)]
+    fn recv<const BATCH: bool>(
+        _state: &UdpSocketState,
+        socket: UdpSockRef<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> io::Result<usize> {
+        // `wasi:sockets` has no vectored receive, and `BATCH_SIZE` is 1 regardless.
+        // Safety: `MaybeUninit<u8>` shares the layout of `u8`, and `recv_from` writes only
+        // the prefix it reports as filled.
+        let buf = unsafe { &mut *(&mut *bufs[0] as *mut [u8] as *mut [MaybeUninit<u8>]) };
+        let (len, addr) = socket.0.recv_from(buf)?;
+        meta[0] = RecvMeta {
+            len,
+            stride: len,
+            addr: addr.as_socket().unwrap(),
+            ecn: None,
+            dst_ip: None,
+            interface_index: None,
+            timestamp: None,
+        };
+        Ok(1)
+    }
+}

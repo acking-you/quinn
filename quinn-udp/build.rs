@@ -26,6 +26,11 @@ fn main() {
                 target_os = "illumos"
             )
         },
+        // Unix targets with the native multi-message receive syscall.
+        recv_mmsg: { all(unix, not(any(
+            apple, target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly",
+            target_os = "redox", target_os = "hurd", solarish
+        ))) },
         // Convenience aliases
         apple_fast: { all(apple, feature = "fast-apple-datapath") },
         apple_slow: { all(apple, not(feature = "fast-apple-datapath")) },
