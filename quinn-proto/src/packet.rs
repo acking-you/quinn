@@ -99,7 +99,7 @@ impl PartialDecode {
     }
 
     /// The destination connection ID of the packet
-    pub fn dst_cid(&self) -> &ConnectionId {
+    pub fn dst_cid(&self) -> ConnectionId {
         self.plain_header.dst_cid()
     }
 
@@ -284,16 +284,16 @@ impl Header {
     pub(crate) fn encode(&self, w: &mut Vec<u8>) -> PartialEncode {
         use Header::*;
         let start = w.len();
-        match *self {
+        match self {
             Initial(InitialHeader {
-                ref dst_cid,
-                ref src_cid,
-                ref token,
+                dst_cid,
+                src_cid,
+                token,
                 number,
                 version,
             }) => {
                 w.write(u8::from(LongHeaderType::Initial) | number.tag());
-                w.write(version);
+                w.write(*version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
                 w.write_var(token.len() as u64);
@@ -308,13 +308,13 @@ impl Header {
             }
             Long {
                 ty,
-                ref dst_cid,
-                ref src_cid,
+                dst_cid,
+                src_cid,
                 number,
                 version,
             } => {
-                w.write(u8::from(LongHeaderType::Standard(ty)) | number.tag());
-                w.write(version);
+                w.write(u8::from(LongHeaderType::Standard(*ty)) | number.tag());
+                w.write(*version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
                 w.write::<u16>(0); // Placeholder for payload length; see `set_payload_length`
@@ -326,12 +326,12 @@ impl Header {
                 }
             }
             Retry {
-                ref dst_cid,
-                ref src_cid,
+                dst_cid,
+                src_cid,
                 version,
             } => {
                 w.write(u8::from(LongHeaderType::Retry));
-                w.write(version);
+                w.write(*version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
                 PartialEncode {
@@ -343,13 +343,13 @@ impl Header {
             Short {
                 spin,
                 key_phase,
-                ref dst_cid,
+                dst_cid,
                 number,
             } => {
                 w.write(
                     FIXED_BIT
-                        | if key_phase { KEY_PHASE_BIT } else { 0 }
-                        | if spin { SPIN_BIT } else { 0 }
+                        | if *key_phase { KEY_PHASE_BIT } else { 0 }
+                        | if *spin { SPIN_BIT } else { 0 }
                         | number.tag(),
                 );
                 w.put_slice(dst_cid);
@@ -361,9 +361,9 @@ impl Header {
                 }
             }
             VersionNegotiate {
-                ref random,
-                ref dst_cid,
-                ref src_cid,
+                random,
+                dst_cid,
+                src_cid,
             } => {
                 w.write(0x80u8 | random);
                 w.write::<u32>(0);
@@ -475,9 +475,8 @@ impl PartialEncode {
         crypto: Option<(u64, &dyn crypto::PacketKey)>,
     ) {
         let Self { header_len, pn, .. } = self;
-        let (pn_len, write_len) = match pn {
-            Some((pn_len, write_len)) => (pn_len, write_len),
-            None => return,
+        let Some((pn_len, write_len)) = pn else {
+            return;
         };
 
         let pn_pos = header_len - pn_len;
@@ -555,14 +554,14 @@ impl ProtectedHeader {
     }
 
     /// The destination Connection ID of the packet
-    pub fn dst_cid(&self) -> &ConnectionId {
+    pub fn dst_cid(&self) -> ConnectionId {
         use ProtectedHeader::*;
         match self {
-            Initial(header) => &header.dst_cid,
-            Long { dst_cid, .. } => dst_cid,
-            Retry { dst_cid, .. } => dst_cid,
-            Short { dst_cid, .. } => dst_cid,
-            VersionNegotiate { dst_cid, .. } => dst_cid,
+            Initial(header) => header.dst_cid,
+            &Long { dst_cid, .. } => dst_cid,
+            &Retry { dst_cid, .. } => dst_cid,
+            &Short { dst_cid, .. } => dst_cid,
+            &VersionNegotiate { dst_cid, .. } => dst_cid,
         }
     }
 
@@ -576,7 +575,7 @@ impl ProtectedHeader {
 
     /// Decode a plain header from given buffer, with given [`ConnectionIdParser`].
     pub fn decode(
-        buf: &mut io::Cursor<BytesMut>,
+        buf: &mut io::Cursor<impl AsRef<[u8]>>,
         cid_parser: &(impl ConnectionIdParser + ?Sized),
         supported_versions: &[u32],
         grease_quic_bit: bool,
@@ -882,7 +881,7 @@ const KEY_PHASE_BIT: u8 = 0x04;
 
 /// Packet number space identifiers
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
-pub enum SpaceId {
+pub(crate) enum SpaceId {
     /// Unprotected packets, used to bootstrap the handshake
     Initial = 0,
     Handshake = 1,
@@ -891,7 +890,7 @@ pub enum SpaceId {
 }
 
 impl SpaceId {
-    pub fn iter() -> impl Iterator<Item = Self> {
+    pub(crate) fn iter() -> impl Iterator<Item = Self> {
         [Self::Initial, Self::Handshake, Self::Data].iter().cloned()
     }
 }

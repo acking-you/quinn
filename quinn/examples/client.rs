@@ -84,7 +84,7 @@ async fn run(options: Opt) -> Result<()> {
             Ok(cert) => {
                 roots.add(CertificateDer::from(cert))?;
             }
-            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 info!("local server certificate not found");
             }
             Err(e) => {
@@ -103,7 +103,7 @@ async fn run(options: Opt) -> Result<()> {
 
     let client_config =
         quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
-    let mut endpoint = quinn::Endpoint::client(options.bind)?;
+    let endpoint = quinn::Endpoint::client(options.bind)?;
     endpoint.set_default_client_config(client_config);
 
     let request = format!("GET {}\r\n", url.path());

@@ -2,6 +2,7 @@
 use std::path::PathBuf;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -9,16 +10,16 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use quinn::{TokioRuntime, crypto::rustls::QuicClientConfig};
+use quinn::{crypto::rustls::QuicClientConfig, TokioRuntime};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 
 use crate::{
-    CommonOpt, PERF_CIPHER_SUITES,
     noprotection::NoProtectionClientConfig,
     parse_byte_size,
     stats::{OpenStreamStats, Stats},
+    CommonOpt, PERF_CIPHER_SUITES,
 };
 
 /// Connects to a QUIC perf server and maintains a specified pattern of requests until interrupted
@@ -166,15 +167,22 @@ pub async fn run(opt: Opt) -> Result<()> {
     let stats_fut = async {
         let interval_duration = Duration::from_secs(opt.interval);
 
+        #[cfg(feature = "json-output")]
+        let allow_table_output = opt.json.clone().is_none_or(|path| path != Path::new("-"));
+        #[cfg(not(feature = "json-output"))]
+        let allow_table_output = true;
+
         loop {
             let start = Instant::now();
             tokio::time::sleep(interval_duration).await;
             {
                 stats.on_interval(start, &stream_stats);
 
-                stats.print();
-                if opt.common.conn_stats {
-                    println!("{:?}\n", connection.stats());
+                if allow_table_output {
+                    stats.print();
+                    if opt.common.conn_stats {
+                        println!("{:?}\n", connection.stats());
+                    }
                 }
             }
         }

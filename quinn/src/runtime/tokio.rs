@@ -12,7 +12,7 @@ use tokio::{
     time::{Sleep, sleep_until},
 };
 
-use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper};
+use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSenderHelper, UdpSenderHelperSocket};
 
 /// A Quinn runtime for Tokio
 #[derive(Debug)]
@@ -27,10 +27,10 @@ impl Runtime for TokioRuntime {
         tokio::spawn(future);
     }
 
-    fn wrap_udp_socket(&self, sock: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
-        Ok(Arc::new(UdpSocket {
-            inner: udp::UdpSocketState::new((&sock).into())?,
-            io: tokio::net::UdpSocket::from_std(sock)?,
+    fn wrap_udp_socket(&self, sock: std::net::UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
+        Ok(Box::new(UdpSocket {
+            inner: Arc::new(udp::UdpSocketState::new((&sock).into())?),
+            io: Arc::new(tokio::net::UdpSocket::from_std(sock)?),
         }))
     }
 
@@ -43,43 +43,56 @@ impl AsyncTimer for Sleep {
     fn reset(self: Pin<&mut Self>, t: Instant) {
         Self::reset(self, t.into())
     }
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         Future::poll(self, cx)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct UdpSocket {
-    io: tokio::net::UdpSocket,
-    inner: udp::UdpSocketState,
+    io: Arc<tokio::net::UdpSocket>,
+    inner: Arc<udp::UdpSocketState>,
+}
+
+impl UdpSenderHelperSocket for UdpSocket {
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_gso_segments()
+    }
+
+    fn try_send(&self, transmit: &udp::Transmit<'_>) -> io::Result<()> {
+        self.io.try_io(Interest::WRITABLE, || {
+            self.inner.try_send((&self.io).into(), transmit)
+        })?;
+
+        Ok(())
+    }
 }
 
 impl AsyncUdpSocket for UdpSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn super::UdpPoller>> {
-        Box::pin(UdpPollHelper::new(move || {
-            let socket = self.clone();
+    fn create_sender(&self) -> Pin<Box<dyn super::UdpSender>> {
+        Box::pin(UdpSenderHelper::new(self.clone(), |socket: &Self| {
+            let socket = socket.clone();
             async move { socket.io.writable().await }
         }))
     }
 
-    fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
-        self.io.try_io(Interest::WRITABLE, || {
-            self.inner.send((&self.io).into(), transmit)
-        })
-    }
-
     fn poll_recv(
-        &self,
-        cx: &mut Context,
-        bufs: &mut [std::io::IoSliceMut<'_>],
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
         loop {
             ready!(self.io.poll_recv_ready(cx))?;
-            if let Ok(res) = self.io.try_io(Interest::READABLE, || {
+            match self.io.try_io(Interest::READABLE, || {
                 self.inner.recv((&self.io).into(), bufs, meta)
             }) {
-                return Poll::Ready(Ok(res));
+                Ok(res) => return Poll::Ready(Ok(res)),
+                // `try_io` clears readiness only for `WouldBlock`. Looping on any other
+                // error would spin: readiness stays asserted, so `poll_recv_ready`
+                // completes at once and the recv fails again, without ever yielding.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
             }
         }
     }
@@ -90,10 +103,6 @@ impl AsyncUdpSocket for UdpSocket {
 
     fn may_fragment(&self) -> bool {
         self.inner.may_fragment()
-    }
-
-    fn max_transmit_segments(&self) -> usize {
-        self.inner.max_gso_segments()
     }
 
     fn max_receive_segments(&self) -> usize {

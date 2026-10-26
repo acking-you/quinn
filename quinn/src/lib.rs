@@ -38,10 +38,8 @@
 //! with a domain name--then as with TLS, self-signed certificates can be used to provide
 //! encryption alone.
 #![warn(missing_docs)]
-#![warn(unreachable_pub)]
-#![warn(clippy::use_self)]
 
-use std::sync::Arc;
+use std::pin::Pin;
 
 mod connection;
 mod endpoint;
@@ -63,9 +61,9 @@ pub use proto::{
     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
     ConnectError, ConnectionClose, ConnectionError, ConnectionId, ConnectionIdGenerator,
     ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout,
-    MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats, ServerConfig, Side, StdSystemTime,
-    StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit,
-    TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
+    InvalidCid, MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats, ServerConfig, Side,
+    StdSystemTime, StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore,
+    Transmit, TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
     VarIntBoundsExceeded, Written, congestion, crypto,
 };
 #[cfg(feature = "qlog")]
@@ -75,19 +73,19 @@ pub use rustls;
 pub use udp;
 
 pub use crate::connection::{
-    AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, SendDatagram,
-    SendDatagramError, ZeroRttAccepted,
+    AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram,
+    RemoteAddressWatcher, SendDatagram, SendDatagramError,
 };
 pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
 pub use crate::recv_stream::{ReadError, ReadExactError, ReadToEndError, RecvStream, ResetError};
-#[cfg(feature = "runtime-async-std")]
-pub use crate::runtime::AsyncStdRuntime;
 #[cfg(feature = "runtime-smol")]
 pub use crate::runtime::SmolRuntime;
 #[cfg(feature = "runtime-tokio")]
 pub use crate::runtime::TokioRuntime;
-pub use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller, default_runtime};
+#[cfg(any(feature = "runtime-tokio", feature = "runtime-smol"))]
+pub use crate::runtime::default_runtime;
+pub use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender};
 pub use crate::send_stream::{SendStream, StoppedError, WriteError};
 
 #[cfg(test)]
@@ -100,10 +98,10 @@ enum ConnectionEvent {
         reason: bytes::Bytes,
     },
     Proto(proto::ConnectionEvent),
-    Rebind(Arc<dyn AsyncUdpSocket>),
+    Rebind(Pin<Box<dyn UdpSender>>),
 }
 
-fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {
+fn udp_transmit<'a>(t: &Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {
     udp::Transmit {
         destination: t.destination,
         ecn: t.ecn.map(udp_ecn),
@@ -113,11 +111,11 @@ fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> 
     }
 }
 
-fn udp_ecn(ecn: proto::EcnCodepoint) -> udp::EcnCodepoint {
+fn udp_ecn(ecn: EcnCodepoint) -> udp::EcnCodepoint {
     match ecn {
-        proto::EcnCodepoint::Ect0 => udp::EcnCodepoint::Ect0,
-        proto::EcnCodepoint::Ect1 => udp::EcnCodepoint::Ect1,
-        proto::EcnCodepoint::Ce => udp::EcnCodepoint::Ce,
+        EcnCodepoint::Ect0 => udp::EcnCodepoint::Ect0,
+        EcnCodepoint::Ect1 => udp::EcnCodepoint::Ect1,
+        EcnCodepoint::Ce => udp::EcnCodepoint::Ce,
     }
 }
 

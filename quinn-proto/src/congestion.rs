@@ -56,8 +56,15 @@ pub trait Controller: Send + Sync {
         now: Instant,
         sent: Instant,
         is_persistent_congestion: bool,
+        is_ecn: bool,
         lost_bytes: u64,
     );
+
+    /// Packets were incorrectly deemed lost
+    ///
+    /// This function is called when all packets that were deemed lost (for instance because
+    /// of packet reordering) are acknowledged after the congestion event was raised.
+    fn on_spurious_congestion_event(&mut self) {}
 
     /// The known MTU for the current network path has been updated
     fn on_mtu_update(&mut self, new_mtu: u16);
@@ -65,12 +72,14 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
-    /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
+    /// Retrieve implementation-specific metrics used to populate connection statistics and `qlog`
+    /// traces when they are enabled
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
             congestion_window: self.window(),
             ssthresh: None,
             pacing_rate: None,
+            bandwidth_estimate: None,
         }
     }
 
@@ -94,6 +103,8 @@ pub struct ControllerMetrics {
     pub ssthresh: Option<u64>,
     /// Pacing rate (bits/s)
     pub pacing_rate: Option<u64>,
+    /// Estimated sustainable path bandwidth (bits/s)
+    pub bandwidth_estimate: Option<u64>,
 }
 
 /// Constructs controllers on demand

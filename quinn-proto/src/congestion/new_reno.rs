@@ -87,6 +87,7 @@ impl Controller for NewReno {
         now: Instant,
         sent: Instant,
         is_persistent_congestion: bool,
+        _is_ecn: bool,
         _lost_bytes: u64,
     ) {
         if sent <= self.recovery_start_time {
@@ -117,6 +118,7 @@ impl Controller for NewReno {
             congestion_window: self.window(),
             ssthresh: Some(self.ssthresh),
             pacing_rate: None,
+            bandwidth_estimate: None,
         }
     }
 

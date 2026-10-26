@@ -10,6 +10,7 @@ use rustc_hash::FxHashSet;
 use tracing::trace;
 
 use super::assembler::Assembler;
+use super::sent_packets::SentPackets;
 use crate::{
     Dir, Duration, Instant, SocketAddr, StreamId, TransportError, VarInt, cid_queue::CidQueue,
     connection::StreamsState, crypto::Keys, frame, packet::SpaceId, range_set::ArrayRangeSet,
@@ -38,8 +39,10 @@ pub(super) struct PacketSpace {
     /// Number of packets in `sent_packets` with numbers above `largest_ack_eliciting_sent`
     pub(super) unacked_non_ack_eliciting_tail: u64,
     /// Transmitted but not acked
-    // We use a BTreeMap here so we can efficiently query by range on ACK and for loss detection
-    pub(super) sent_packets: BTreeMap<u64, SentPacket>,
+    pub(super) sent_packets: SentPackets,
+    /// Packets that were deemed lost
+    // Older packets are regularly removed in `Connection::drain_lost_packets`.
+    pub(super) lost_packets: BTreeMap<u64, LostPacket>,
     /// Number of explicit congestion notification codepoints seen on incoming packets
     pub(super) ecn_counters: frame::EcnCounts,
     /// Recent ECN counters sent by the peer in ACK frames
@@ -84,7 +87,8 @@ impl PacketSpace {
             largest_acked_packet_sent: now,
             largest_ack_eliciting_sent: 0,
             unacked_non_ack_eliciting_tail: 0,
-            sent_packets: BTreeMap::new(),
+            sent_packets: SentPackets::default(),
+            lost_packets: BTreeMap::new(),
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
 
@@ -115,6 +119,7 @@ impl PacketSpace {
     pub(super) fn maybe_queue_probe(
         &mut self,
         request_immediate_ack: bool,
+        has_ack_eliciting_data: bool,
         streams: &StreamsState,
     ) {
         if self.loss_probes == 0 {
@@ -129,6 +134,12 @@ impl PacketSpace {
 
         if !self.pending.is_empty(streams) {
             // There's real data to send here, no need to make something up
+            return;
+        }
+
+        if has_ack_eliciting_data {
+            // A fitting DATAGRAM is held outside `pending` until packet assembly, but it
+            // still makes the probe ack-eliciting without a fallback frame.
             return;
         }
 
@@ -206,7 +217,7 @@ impl PacketSpace {
 
     /// Stop tracking sent packet `number`, and return what we knew about it
     pub(super) fn take(&mut self, number: u64) -> Option<SentPacket> {
-        let packet = self.sent_packets.remove(&number)?;
+        let packet = self.sent_packets.remove(number)?;
         if !packet.ack_eliciting && number > self.largest_ack_eliciting_sent {
             self.unacked_non_ack_eliciting_tail =
                 self.unacked_non_ack_eliciting_tail.checked_sub(1).unwrap();
@@ -229,7 +240,7 @@ impl PacketSpace {
             self.unacked_non_ack_eliciting_tail = 0;
             self.largest_ack_eliciting_sent = number;
         } else if self.unacked_non_ack_eliciting_tail > MAX_UNACKED_NON_ACK_ELICTING_TAIL {
-            let oldest_after_ack_eliciting = *self
+            let oldest_after_ack_eliciting = self
                 .sent_packets
                 .range((
                     Bound::Excluded(self.largest_ack_eliciting_sent),
@@ -244,7 +255,7 @@ impl PacketSpace {
             // in-flight counters if padded.
             let packet = self
                 .sent_packets
-                .remove(&oldest_after_ack_eliciting)
+                .remove(oldest_after_ack_eliciting)
                 .unwrap();
             debug_assert!(!packet.ack_eliciting);
             forgotten = Some(packet);
@@ -258,10 +269,7 @@ impl PacketSpace {
 
     /// Whether any congestion-controlled packets in this space are not yet acknowledged or lost
     pub(super) fn has_in_flight(&self) -> bool {
-        // The number of non-congestion-controlled (i.e. size == 0) packets in flight at a time
-        // should be small, since otherwise congestion control wouldn't be effective. Therefore,
-        // this shouldn't need to visit many packets before finishing one way or another.
-        self.sent_packets.values().any(|x| x.size != 0)
+        self.sent_packets.has_in_flight()
     }
 }
 
@@ -303,6 +311,13 @@ pub(super) struct SentPacket {
     pub(super) stream_frames: frame::StreamMetaVec,
 }
 
+/// Represents one or more packets that are deemed lost.
+#[derive(Debug)]
+pub(super) struct LostPacket {
+    /// The time the packet was sent.
+    pub(super) time_sent: Instant,
+}
+
 /// Retransmittable data queue
 #[allow(unreachable_pub)] // fuzzing only
 #[derive(Debug, Default, Clone)]
@@ -310,6 +325,7 @@ pub struct Retransmits {
     pub(super) max_data: bool,
     pub(super) data_blocked: bool,
     pub(super) max_stream_id: [bool; 2],
+    pub(super) streams_blocked: [bool; 2],
     pub(super) reset_stream: Vec<(StreamId, VarInt)>,
     pub(super) stop_sending: Vec<frame::StopSending>,
     pub(super) max_stream_data: FxHashSet<StreamId>,
@@ -356,6 +372,7 @@ impl Retransmits {
         !self.max_data
             && !(self.data_blocked && streams.can_send_data_blocked())
             && !self.max_stream_id.into_iter().any(|x| x)
+            && !self.streams_blocked.into_iter().any(|x| x)
             && self.reset_stream.is_empty()
             && self.stop_sending.is_empty()
             && self
@@ -388,6 +405,7 @@ impl ::std::ops::BitOrAssign for Retransmits {
         self.data_blocked |= rhs.data_blocked;
         for dir in Dir::iter() {
             self.max_stream_id[dir as usize] |= rhs.max_stream_id[dir as usize];
+            self.streams_blocked[dir as usize] |= rhs.streams_blocked[dir as usize];
         }
         self.reset_stream.extend_from_slice(&rhs.reset_stream);
         self.stop_sending.extend_from_slice(&rhs.stop_sending);
@@ -473,15 +491,6 @@ pub(super) struct Dedup {
     next: u64,
 }
 
-/// Inner bitfield type.
-///
-/// Because QUIC never reuses packet numbers, this only needs to be large enough to deal with
-/// packets that are reordered but still delivered in a timely manner.
-type Window = u128;
-
-/// Number of packets tracked by `Dedup`.
-const WINDOW_SIZE: u64 = 1 + mem::size_of::<Window>() as u64 * 8;
-
 impl Dedup {
     /// Construct an empty window positioned at the start.
     pub(super) fn new() -> Self {
@@ -528,7 +537,7 @@ impl Dedup {
     fn smallest_missing_in_interval(&self, lower_bound: u64, upper_bound: u64) -> Option<u64> {
         debug_assert!(lower_bound <= upper_bound);
         debug_assert!(upper_bound <= self.highest());
-        const BITFIELD_SIZE: u64 = (mem::size_of::<Window>() * 8) as u64;
+        const BITFIELD_SIZE: u64 = Window::BITS as u64;
 
         // Since we already know the packets at the boundaries have been received, we only need to
         // check those in between them (this removes the necessity of extra logic to deal with the
@@ -583,6 +592,15 @@ impl Dedup {
             .is_some()
     }
 }
+
+/// Inner bitfield type
+///
+/// Because QUIC never reuses packet numbers, this only needs to be large enough to deal with
+/// packets that are reordered but still delivered in a timely manner.
+type Window = u128;
+
+/// Number of packets tracked by `Dedup`
+const WINDOW_SIZE: u64 = 1 + size_of::<Window>() as u64 * 8;
 
 /// Indicates which data is available for sending
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -689,7 +707,7 @@ impl PendingAcks {
     /// Returns the delay since the packet with the largest packet number was received
     pub(super) fn ack_delay(&self, now: Instant) -> Duration {
         self.largest_packet
-            .map_or(Duration::default(), |(_, received)| now - received)
+            .map_or_else(Duration::default, |(_, received)| now - received)
     }
 
     /// Handle receipt of a new packet
@@ -1116,6 +1134,6 @@ mod test {
     fn sent_packet_size() {
         // The tracking state of sent packets should be minimal, and not grow
         // over time.
-        assert!(std::mem::size_of::<SentPacket>() <= 128);
+        assert!(size_of::<SentPacket>() <= 128);
     }
 }

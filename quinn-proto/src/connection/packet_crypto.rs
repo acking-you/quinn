@@ -22,7 +22,7 @@ pub(super) fn unprotect_header(
             return None;
         }
     } else if let Some(space) = partial_decode.space() {
-        if let Some(ref crypto) = spaces[space].crypto {
+        if let Some(crypto) = &spaces[space].crypto {
             Some(&*crypto.header.remote)
         } else {
             debug!(
@@ -88,11 +88,8 @@ pub(super) fn decrypt_packet_body(
         &zero_rtt_crypto.unwrap().packet
     } else if packet_key_phase == conn_key_phase || space != SpaceId::Data {
         &spaces[space].crypto.as_ref().unwrap().packet.remote
-    } else if let Some(prev) = prev_crypto.filter(|&crypto|
-        // Use the previous keys if this packet comes prior to acknowledgment of the
-        // key update by the peer; otherwise, this must be a remotely-initiated key
-        // update, so fall through to the final case.
-        crypto.end_packet.is_none_or(|(pn, _)| number < pn))
+    } else if let Some(prev) =
+        prev_crypto.filter(|&crypto| crypto.end_packet.is_none_or(|(pn, _)| number < pn))
     {
         &prev.crypto.remote
     } else {
@@ -118,10 +115,11 @@ pub(super) fn decrypt_packet_body(
     }
 
     let mut outgoing_key_update_acked = false;
-    if let Some(prev) = prev_crypto {
-        if prev.end_packet.is_none() && packet_key_phase == conn_key_phase {
-            outgoing_key_update_acked = true;
-        }
+    if let Some(prev) = prev_crypto
+        && prev.end_packet.is_none()
+        && packet_key_phase == conn_key_phase
+    {
+        outgoing_key_update_acked = true;
     }
 
     if crypto_update {

@@ -10,7 +10,7 @@ use super::{
 use crate::{Duration, Instant, TIMER_GRANULARITY, TransportConfig, congestion, packet::SpaceId};
 
 #[cfg(feature = "qlog")]
-use qlog::events::quic::MetricsUpdated;
+use qlog::events::{ExData, quic::RecoveryMetricsUpdated};
 
 /// Description of a particular network path
 pub(super) struct PathData {
@@ -75,6 +75,7 @@ impl PathData {
                 config.initial_rtt,
                 congestion.initial_window(),
                 config.get_initial_mtu(),
+                config.max_outgoing_bytes_per_second,
                 now,
             ),
             congestion,
@@ -87,8 +88,8 @@ impl PathData {
                 .mtu_discovery_config
                 .as_ref()
                 .filter(|_| allow_mtud)
-                .map_or(
-                    MtuDiscovery::disabled(config.get_initial_mtu(), config.min_mtu),
+                .map_or_else(
+                    || MtuDiscovery::disabled(config.get_initial_mtu(), config.min_mtu),
                     |mtud_config| {
                         MtuDiscovery::new(
                             config.get_initial_mtu(),
@@ -118,7 +119,13 @@ impl PathData {
         Self {
             remote,
             rtt: prev.rtt,
-            pacing: Pacer::new(smoothed_rtt, congestion.window(), prev.current_mtu(), now),
+            pacing: Pacer::new(
+                smoothed_rtt,
+                congestion.window(),
+                prev.current_mtu(),
+                prev.pacing.max_bytes_per_second(),
+                now,
+            ),
             sending_ecn: true,
             congestion,
             challenge: None,
@@ -150,6 +157,7 @@ impl PathData {
             self.rtt.get(),
             self.congestion.initial_window(),
             self.current_mtu(),
+            config.max_outgoing_bytes_per_second,
             now,
         );
     }
@@ -187,7 +195,10 @@ impl PathData {
     }
 
     #[cfg(feature = "qlog")]
-    pub(super) fn qlog_recovery_metrics(&mut self, pto_count: u32) -> Option<MetricsUpdated> {
+    pub(super) fn qlog_recovery_metrics(
+        &mut self,
+        pto_count: u32,
+    ) -> Option<RecoveryMetricsUpdated> {
         let controller_metrics = self.congestion.metrics();
 
         let metrics = RecoveryMetrics {
@@ -262,18 +273,25 @@ impl RecoveryMetrics {
     }
 
     /// Emit a `MetricsUpdated` event containing only updated values
-    fn to_qlog_event(&self, previous: &Self) -> Option<MetricsUpdated> {
+    fn to_qlog_event(&self, previous: &Self) -> Option<RecoveryMetricsUpdated> {
         let updated = self.retain_updated(previous);
 
         if updated == Self::default() {
             return None;
         }
 
-        Some(MetricsUpdated {
-            min_rtt: updated.min_rtt.map(|rtt| rtt.as_secs_f32()),
-            smoothed_rtt: updated.smoothed_rtt.map(|rtt| rtt.as_secs_f32()),
-            latest_rtt: updated.latest_rtt.map(|rtt| rtt.as_secs_f32()),
-            rtt_variance: updated.rtt_variance.map(|rtt| rtt.as_secs_f32()),
+        Some(RecoveryMetricsUpdated {
+            ex_data: ExData::default(),
+            min_rtt: updated.min_rtt.map(|rtt| rtt.as_micros() as f32 / 1000.0),
+            smoothed_rtt: updated
+                .smoothed_rtt
+                .map(|rtt| rtt.as_micros() as f32 / 1000.0),
+            latest_rtt: updated
+                .latest_rtt
+                .map(|rtt| rtt.as_micros() as f32 / 1000.0),
+            rtt_variance: updated
+                .rtt_variance
+                .map(|rtt| rtt.as_micros() as f32 / 1000.0),
             pto_count: updated
                 .pto_count
                 .map(|count| count.try_into().unwrap_or(u16::MAX)),

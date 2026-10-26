@@ -8,11 +8,7 @@ use thiserror::Error;
 use tracing::trace;
 
 use super::spaces::{Retransmits, ThinRetransmits};
-use crate::{
-    Dir, StreamId, VarInt,
-    connection::streams::state::{get_or_insert_recv, get_or_insert_send},
-    frame,
-};
+use crate::{Dir, StreamId, VarInt, connection::streams::state::get_or_insert_recv, frame};
 
 mod recv;
 use recv::Recv;
@@ -48,14 +44,14 @@ impl<'a> Streams<'a> {
             return None;
         }
 
-        // TODO: Queue STREAM_ID_BLOCKED if this fails
         if self.state.next[dir as usize] >= self.state.max[dir as usize] {
+            self.state.streams_blocked[dir as usize] = true;
             return None;
         }
 
         self.state.next[dir as usize] += 1;
         let id = StreamId::new(self.state.side, dir, self.state.next[dir as usize] - 1);
-        self.state.insert(false, id);
+        self.state.insert_local(id);
         self.state.send_streams += 1;
         Some(id)
     }
@@ -138,7 +134,7 @@ impl RecvStream<'_> {
             hash_map::Entry::Occupied(s) => s,
             hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
         };
-        let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
+        let stream = get_or_insert_recv(entry.get_mut(), self.state.stream_receive_window);
 
         let (read_credits, stop_sending) = stream.stop()?;
         if stop_sending.should_transmit() {
@@ -248,8 +244,8 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
-            .ok_or(WriteError::ClosedStream)?;
+            .ok_or(WriteError::ClosedStream)?
+            .get_or_insert_with(|| Send::new(max_send_data));
 
         if limit == 0 {
             trace!(
@@ -311,8 +307,8 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
-            .ok_or(FinishError::ClosedStream)?;
+            .ok_or(FinishError::ClosedStream)?
+            .get_or_insert_with(|| Send::new(max_send_data));
 
         let was_pending = stream.is_pending();
         stream.finish()?;
@@ -333,8 +329,8 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
-            .ok_or(ClosedStream { _private: () })?;
+            .ok_or(ClosedStream { _private: () })?
+            .get_or_insert_with(|| Send::new(max_send_data));
 
         if matches!(stream.state, SendState::ResetSent) {
             // Redundant reset call
@@ -362,8 +358,8 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
-            .ok_or(ClosedStream { _private: () })?;
+            .ok_or(ClosedStream { _private: () })?
+            .get_or_insert_with(|| Send::new(max_send_data));
 
         stream.priority = priority;
         Ok(())
@@ -474,7 +470,9 @@ struct PendingStream {
 /// Application events about streams
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamEvent {
-    /// One or more new streams has been opened and might be readable
+    /// One or more new streams has been opened and can be accepted
+    ///
+    /// A separate [`StreamEvent::Readable`] is emitted once data arrives.
     Opened {
         /// Directionality for which streams have been opened
         dir: Dir,

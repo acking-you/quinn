@@ -2,8 +2,7 @@ use std::{
     collections::VecDeque,
     fmt,
     future::Future,
-    io,
-    io::IoSliceMut,
+    io::{self, IoSliceMut},
     mem,
     net::{SocketAddr, SocketAddrV6},
     pin::Pin,
@@ -12,14 +11,18 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    task::{Context, Poll, Waker},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-#[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring")))]
+#[cfg(all(
+    not(wasm_browser),
+    any(feature = "runtime-tokio", feature = "runtime-smol"),
+    any(feature = "aws-lc-rs", feature = "ring"),
+))]
 use crate::runtime::default_runtime;
 use crate::{
     Instant,
-    runtime::{AsyncUdpSocket, Runtime},
+    runtime::{AsyncUdpSocket, Runtime, UdpSender},
     udp_transmit,
 };
 use bytes::{Bytes, BytesMut};
@@ -29,11 +32,15 @@ use proto::{
     EndpointEvent, ServerConfig,
 };
 use rustc_hash::FxHashMap;
-#[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring"),))]
+#[cfg(all(
+    not(wasm_browser),
+    any(feature = "runtime-tokio", feature = "runtime-smol"),
+    any(feature = "aws-lc-rs", feature = "ring"),
+))]
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{Notify, futures::Notified, mpsc};
 use tracing::{Instrument, Span};
-use udp::{BATCH_SIZE, RecvMeta};
+use udp::{BATCH_SIZE, RecvMeta, is_msg_size_err};
 
 use crate::{
     ConnectionEvent, EndpointConfig, IO_LOOP_BOUND, RECV_TIME_BOUND, VarInt,
@@ -49,7 +56,6 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub(crate) inner: EndpointRef,
-    pub(crate) default_client_config: Option<ClientConfig>,
     runtime: Arc<dyn Runtime>,
 }
 
@@ -71,13 +77,17 @@ impl Endpoint {
     ///
     /// Some environments may not allow creation of dual-stack sockets, in which case an IPv6
     /// client will only be able to connect to IPv6 servers. An IPv4 client is never dual-stack.
-    #[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring")))] // `EndpointConfig::default()` is only available with these
+    #[cfg(all(
+        not(wasm_browser),
+        any(feature = "runtime-tokio", feature = "runtime-smol"),
+        any(feature = "aws-lc-rs", feature = "ring"), // `EndpointConfig::default()` is only available with these
+    ))]
     pub fn client(addr: SocketAddr) -> io::Result<Self> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        if addr.is_ipv6() {
-            if let Err(e) = socket.set_only_v6(false) {
-                tracing::debug!(%e, "unable to make socket dual-stack");
-            }
+        if addr.is_ipv6()
+            && let Err(e) = socket.set_only_v6(false)
+        {
+            tracing::debug!(%e, "unable to make socket dual-stack");
         }
         socket.bind(&addr.into())?;
         let runtime =
@@ -97,19 +107,37 @@ impl Endpoint {
 
     /// Helper to construct an endpoint for use with both incoming and outgoing connections
     ///
-    /// Platform defaults for dual-stack sockets vary. For example, any socket bound to a wildcard
-    /// IPv6 address on Windows will not by default be able to communicate with IPv4
-    /// addresses. Portable applications should bind an address that matches the family they wish to
-    /// communicate within.
-    #[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring")))] // `EndpointConfig::default()` is only available with these
+    /// Note that `addr` is the *local* address to bind to, which should usually be a wildcard
+    /// address like `0.0.0.0:0` or `[::]:0`, which allow communication with any reachable IPv4 or
+    /// IPv6 address respectively from an OS-assigned port.
+    ///
+    /// If an IPv6 address is provided, attempts to make the socket dual-stack so as to allow
+    /// communication with both IPv4 and IPv6 clients. As such, calling `Endpoint::server` with
+    /// the address `[::]:0` is a reasonable default to maximize the ability to accept connections
+    /// from any address.
+    ///
+    /// Some environments may not allow creation of dual-stack sockets, in which case an IPv6
+    /// server will only be able to accept connections from IPv6 clients. An IPv4 server is never
+    /// dual-stack.
+    #[cfg(all(
+        not(wasm_browser),
+        any(feature = "runtime-tokio", feature = "runtime-smol"),
+        any(feature = "aws-lc-rs", feature = "ring"), // `EndpointConfig::default()` is only available with these
+    ))]
     pub fn server(config: ServerConfig, addr: SocketAddr) -> io::Result<Self> {
-        let socket = std::net::UdpSocket::bind(addr)?;
+        let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+        if addr.is_ipv6()
+            && let Err(e) = socket.set_only_v6(false)
+        {
+            tracing::debug!(%e, "unable to make socket dual-stack");
+        }
+        socket.bind(&addr.into())?;
         let runtime =
             default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
         Self::new_with_abstract_socket(
             EndpointConfig::default(),
             Some(config),
-            runtime.wrap_udp_socket(socket)?,
+            runtime.wrap_udp_socket(socket.into())?,
             runtime,
         )
     }
@@ -133,19 +161,14 @@ impl Endpoint {
     pub fn new_with_abstract_socket(
         config: EndpointConfig,
         server_config: Option<ServerConfig>,
-        socket: Arc<dyn AsyncUdpSocket>,
+        socket: Box<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> io::Result<Self> {
         let addr = socket.local_addr()?;
         let allow_mtud = !socket.may_fragment();
         let rc = EndpointRef::new(
             socket,
-            proto::Endpoint::new(
-                Arc::new(config),
-                server_config.map(Arc::new),
-                allow_mtud,
-                None,
-            ),
+            proto::Endpoint::new(Arc::new(config), server_config.map(Arc::new), allow_mtud),
             addr.is_ipv6(),
             runtime.clone(),
         );
@@ -158,11 +181,7 @@ impl Endpoint {
             }
             .instrument(Span::current()),
         ));
-        Ok(Self {
-            inner: rc,
-            default_client_config: None,
-            runtime,
-        })
+        Ok(Self { inner: rc, runtime })
     }
 
     /// Get the next incoming connection attempt from a client
@@ -179,8 +198,8 @@ impl Endpoint {
     }
 
     /// Set the client configuration used by `connect`
-    pub fn set_default_client_config(&mut self, config: ClientConfig) {
-        self.default_client_config = Some(config);
+    pub fn set_default_client_config(&self, config: ClientConfig) {
+        self.inner.0.state.lock().unwrap().default_client_config = Some(config);
     }
 
     /// Connect to a remote endpoint
@@ -192,9 +211,16 @@ impl Endpoint {
     /// May fail immediately due to configuration errors, or in the future if the connection could
     /// not be established.
     pub fn connect(&self, addr: SocketAddr, server_name: &str) -> Result<Connecting, ConnectError> {
-        let config = match &self.default_client_config {
-            Some(config) => config.clone(),
-            None => return Err(ConnectError::NoDefaultClientConfig),
+        let Some(config) = self
+            .inner
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .default_client_config
+            .clone()
+        else {
+            return Err(ConnectError::NoDefaultClientConfig);
         };
 
         self.connect_with(config, addr, server_name)
@@ -228,12 +254,12 @@ impl Endpoint {
             .inner
             .connect(self.runtime.now(), config, addr, server_name)?;
 
-        let socket = endpoint.socket.clone();
+        let sender = endpoint.socket.create_sender();
         endpoint.stats.outgoing_handshakes += 1;
         Ok(endpoint
             .recv_state
             .connections
-            .insert(ch, conn, socket, self.runtime.clone()))
+            .insert(ch, conn, sender, false, self.runtime.clone()))
     }
 
     /// Switch to a new UDP socket
@@ -250,16 +276,17 @@ impl Endpoint {
     /// connections and connections to servers unreachable from the new address will be lost.
     ///
     /// On error, the old UDP socket is retained.
-    pub fn rebind_abstract(&self, socket: Arc<dyn AsyncUdpSocket>) -> io::Result<()> {
+    pub fn rebind_abstract(&self, socket: Box<dyn AsyncUdpSocket>) -> io::Result<()> {
         let addr = socket.local_addr()?;
         let mut inner = self.inner.state.lock().unwrap();
         inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
+        inner.sender = inner.socket.create_sender();
         inner.ipv6 = addr.is_ipv6();
 
         // Update connection socket references
         for sender in inner.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.clone()));
+            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.create_sender()));
         }
         if let Some(driver) = inner.driver.take() {
             // Ensure the driver can register for wake-ups from the new socket
@@ -324,7 +351,7 @@ impl Endpoint {
         loop {
             {
                 let endpoint = &mut *self.inner.state.lock().unwrap();
-                if endpoint.recv_state.connections.is_empty() {
+                if endpoint.is_idle() {
                     break;
                 }
                 // Construct future while lock is held to avoid race
@@ -339,13 +366,13 @@ impl Endpoint {
 #[non_exhaustive]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct EndpointStats {
-    /// Cummulative number of Quic handshakes accepted by this [Endpoint]
+    /// Cumulative number of Quic handshakes accepted by this [Endpoint]
     pub accepted_handshakes: u64,
-    /// Cummulative number of Quic handshakees sent from this [Endpoint]
+    /// Cumulative number of Quic handshakes sent from this [Endpoint]
     pub outgoing_handshakes: u64,
-    /// Cummulative number of Quic handshakes refused on this [Endpoint]
+    /// Cumulative number of Quic handshakes refused on this [Endpoint]
     pub refused_handshakes: u64,
-    /// Cummulative number of Quic handshakes ignored on this [Endpoint]
+    /// Cumulative number of Quic handshakes ignored on this [Endpoint]
     pub ignored_handshakes: u64,
 }
 
@@ -366,10 +393,11 @@ pub(crate) struct EndpointDriver(pub(crate) EndpointRef);
 impl Future for EndpointDriver {
     type Output = Result<(), io::Error>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut endpoint = self.0.state.lock().unwrap();
-        if endpoint.driver.is_none() {
-            endpoint.driver = Some(cx.waker().clone());
+        match endpoint.driver.as_mut() {
+            Some(old_waker) => old_waker.clone_from(cx.waker()),
+            None => endpoint.driver = Some(cx.waker().clone()),
         }
 
         let now = endpoint.runtime.now();
@@ -381,9 +409,7 @@ impl Future for EndpointDriver {
             self.0.shared.incoming.notify_waiters();
         }
 
-        if self.0.shared.ref_count.load(Ordering::Relaxed) == 0
-            && endpoint.recv_state.connections.is_empty()
-        {
+        if self.0.shared.ref_count.load(Ordering::Relaxed) == 0 && endpoint.is_idle() {
             Poll::Ready(Ok(()))
         } else {
             drop(endpoint);
@@ -408,8 +434,10 @@ impl Drop for EndpointDriver {
         endpoint.recv_state.connections.senders.clear();
         // Clearing the senders is what makes the endpoint idle, but a waiter already parked on
         // `idle` only re-reads that after being notified, and with the driver gone nothing else
-        // can wake it.
-        self.0.shared.idle.notify_waiters();
+        // can wake it. Same reason as the equivalent check in `EndpointInner::accept`.
+        if endpoint.is_idle() {
+            self.0.shared.idle.notify_waiters();
+        }
     }
 }
 
@@ -425,29 +453,60 @@ impl EndpointInner {
         incoming: proto::Incoming,
         server_config: Option<Arc<ServerConfig>>,
     ) -> Result<Connecting, ConnectionError> {
-        let mut state = self.state.lock().unwrap();
         let mut response_buffer = Vec::new();
-        let now = state.runtime.now();
-        match state
-            .inner
-            .accept(incoming, now, &mut response_buffer, server_config)
-        {
+
+        // Phase 1: reserve endpoint state for the connection under the lock.
+        let accepting = {
+            let mut state = self.state.lock().unwrap();
+            let now = state.runtime.now();
+            match state
+                .inner
+                .start_accept(incoming, now, &mut response_buffer, server_config)
+            {
+                Ok(accepting) => {
+                    state.pending_accepts += 1;
+                    accepting
+                }
+                Err(error) => {
+                    if let Some(transmit) = error.response {
+                        respond(transmit, &response_buffer, &mut state.sender);
+                    }
+                    return Err(error.cause);
+                }
+            }
+        };
+
+        // Phase 2: TLS session setup, connection construction, and first-packet handling,
+        // without holding the lock.
+        let accepted = accepting.accept();
+
+        // Phase 3: register the connection, or release the reservation, under the lock.
+        let mut state = self.state.lock().unwrap();
+        state.pending_accepts -= 1;
+        let result = match state.inner.finish_accept(accepted, &mut response_buffer) {
             Ok((handle, conn)) => {
                 state.stats.accepted_handshakes += 1;
-                let socket = state.socket.clone();
+                let sender = state.socket.create_sender();
                 let runtime = state.runtime.clone();
+                let driver_lost = state.driver_lost;
                 Ok(state
                     .recv_state
                     .connections
-                    .insert(handle, conn, socket, runtime))
+                    .insert(handle, conn, sender, driver_lost, runtime))
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
-                    respond(transmit, &response_buffer, &*state.socket);
+                    respond(transmit, &response_buffer, &mut state.sender);
                 }
                 Err(error.cause)
             }
+        };
+        // Failed accepts and accepts completed after driver loss cannot rely on a Drained event
+        // being processed to wake idle waiters.
+        if state.is_idle() {
+            self.shared.idle.notify_waiters();
         }
+        result
     }
 
     pub(crate) fn refuse(&self, incoming: proto::Incoming) {
@@ -455,14 +514,14 @@ impl EndpointInner {
         state.stats.refused_handshakes += 1;
         let mut response_buffer = Vec::new();
         let transmit = state.inner.refuse(incoming, &mut response_buffer);
-        respond(transmit, &response_buffer, &*state.socket);
+        respond(transmit, &response_buffer, &mut state.sender);
     }
 
     pub(crate) fn retry(&self, incoming: proto::Incoming) -> Result<(), proto::RetryError> {
         let mut state = self.state.lock().unwrap();
         let mut response_buffer = Vec::new();
         let transmit = state.inner.retry(incoming, &mut response_buffer)?;
-        respond(transmit, &response_buffer, &*state.socket);
+        respond(transmit, &response_buffer, &mut state.sender);
         Ok(())
     }
 
@@ -475,10 +534,11 @@ impl EndpointInner {
 
 #[derive(Debug)]
 pub(crate) struct State {
-    socket: Arc<dyn AsyncUdpSocket>,
+    socket: Box<dyn AsyncUdpSocket>,
+    sender: Pin<Box<dyn UdpSender>>,
     /// During an active migration, abandoned_socket receives traffic
     /// until the first packet arrives on the new socket.
-    prev_socket: Option<Arc<dyn AsyncUdpSocket>>,
+    prev_socket: Option<Box<dyn AsyncUdpSocket>>,
     inner: proto::Endpoint,
     recv_state: RecvState,
     driver: Option<Waker>,
@@ -487,6 +547,9 @@ pub(crate) struct State {
     driver_lost: bool,
     runtime: Arc<dyn Runtime>,
     stats: EndpointStats,
+    default_client_config: Option<ClientConfig>,
+    /// Connections in the process of being accepted
+    pending_accepts: usize,
 }
 
 #[derive(Debug)]
@@ -498,21 +561,31 @@ pub(crate) struct Shared {
 }
 
 impl State {
-    fn drive_recv(&mut self, cx: &mut Context, now: Instant) -> Result<bool, io::Error> {
+    fn drive_recv(&mut self, cx: &mut Context<'_>, now: Instant) -> Result<bool, io::Error> {
         let get_time = || self.runtime.now();
         self.recv_state.recv_limiter.start_cycle(get_time);
-        if let Some(socket) = &self.prev_socket {
+        if let Some(socket) = &mut self.prev_socket {
             // We don't care about the `PollProgress` from old sockets.
-            let poll_res =
-                self.recv_state
-                    .poll_socket(cx, &mut self.inner, &**socket, &*self.runtime, now);
+            let poll_res = self.recv_state.poll_socket(
+                cx,
+                &mut self.inner,
+                &mut **socket,
+                &mut self.sender,
+                &*self.runtime,
+                now,
+            );
             if poll_res.is_err() {
                 self.prev_socket = None;
             }
         };
-        let poll_res =
-            self.recv_state
-                .poll_socket(cx, &mut self.inner, &*self.socket, &*self.runtime, now);
+        let poll_res = self.recv_state.poll_socket(
+            cx,
+            &mut self.inner,
+            &mut *self.socket,
+            &mut self.sender,
+            &*self.runtime,
+            now,
+        );
         self.recv_state.recv_limiter.finish_cycle(get_time);
         let poll_res = poll_res?;
         if poll_res.received_connection_packet {
@@ -523,7 +596,7 @@ impl State {
         Ok(poll_res.keep_going)
     }
 
-    fn handle_events(&mut self, cx: &mut Context, shared: &Shared) -> bool {
+    fn handle_events(&mut self, cx: &mut Context<'_>, shared: &Shared) -> bool {
         for _ in 0..IO_LOOP_BOUND {
             let (ch, event) = match self.events.poll_recv(cx) {
                 Poll::Ready(Some(x)) => x,
@@ -535,7 +608,7 @@ impl State {
 
             if event.is_drained() {
                 self.recv_state.connections.senders.remove(&ch);
-                if self.recv_state.connections.is_empty() {
+                if self.is_idle() {
                     shared.idle.notify_waiters();
                 }
             }
@@ -554,6 +627,10 @@ impl State {
 
         true
     }
+
+    fn is_idle(&self) -> bool {
+        self.recv_state.connections.is_empty() && self.pending_accepts == 0
+    }
 }
 
 impl Drop for State {
@@ -564,7 +641,11 @@ impl Drop for State {
     }
 }
 
-fn respond(transmit: proto::Transmit, response_buffer: &[u8], socket: &dyn AsyncUdpSocket) {
+fn respond(
+    transmit: proto::Transmit,
+    response_buffer: &[u8],
+    sender: &mut Pin<Box<dyn UdpSender>>,
+) {
     // Send if there's kernel buffer space; otherwise, drop it
     //
     // As an endpoint-generated packet, we know this is an
@@ -585,7 +666,29 @@ fn respond(transmit: proto::Transmit, response_buffer: &[u8], socket: &dyn Async
     // to transmit. This is morally equivalent to the packet getting
     // lost due to congestion further along the link, which
     // similarly relies on peer retries for recovery.
-    _ = socket.try_send(&udp_transmit(&transmit, &response_buffer[..transmit.size]));
+
+    // Copied from rust 1.85's std::task::Waker::noop() implementation for backwards compatibility
+    const NOOP: RawWaker = {
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            // Cloning just returns a new no-op raw waker
+            |_| NOOP,
+            // `wake` does nothing
+            |_| {},
+            // `wake_by_ref` does nothing
+            |_| {},
+            // Dropping does nothing as we don't allocate anything
+            |_| {},
+        );
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    };
+    // SAFETY: Copied from rust stdlib, the NOOP waker is thread-safe and doesn't violate the RawWakerVTable contract,
+    // it doesn't access the data pointer at all.
+    let waker = unsafe { Waker::from_raw(NOOP) };
+    let mut cx = Context::from_waker(&waker);
+    _ = sender.as_mut().poll_send(
+        &udp_transmit(&transmit, &response_buffer[..transmit.size]),
+        &mut cx,
+    );
 }
 
 #[inline]
@@ -612,19 +715,27 @@ impl ConnectionSet {
         &mut self,
         handle: ConnectionHandle,
         conn: proto::Connection,
-        socket: Arc<dyn AsyncUdpSocket>,
+        sender: Pin<Box<dyn UdpSender>>,
+        driver_lost: bool,
         runtime: Arc<dyn Runtime>,
     ) -> Connecting {
         let (send, recv) = mpsc::unbounded_channel();
-        if let Some((error_code, ref reason)) = self.close {
+        if let Some((error_code, reason)) = &self.close {
             send.send(ConnectionEvent::Close {
-                error_code,
+                error_code: *error_code,
                 reason: reason.clone(),
             })
             .unwrap();
         }
-        self.senders.insert(handle, send);
-        Connecting::new(handle, conn, self.sender.clone(), recv, socket, runtime)
+        match driver_lost {
+            // Close the event channel before spawning the connection driver, so it cannot
+            // transmit a handshake after the endpoint driver has stopped.
+            true => drop(send),
+            false => {
+                self.senders.insert(handle, send);
+            }
+        }
+        Connecting::new(handle, conn, self.sender.clone(), recv, sender, runtime)
     }
 
     fn is_empty(&self) -> bool {
@@ -683,13 +794,14 @@ pub(crate) struct EndpointRef(Arc<EndpointInner>);
 
 impl EndpointRef {
     pub(crate) fn new(
-        socket: Arc<dyn AsyncUdpSocket>,
+        socket: Box<dyn AsyncUdpSocket>,
         inner: proto::Endpoint,
         ipv6: bool,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
         let (sender, events) = mpsc::unbounded_channel();
         let recv_state = RecvState::new(sender, socket.max_receive_segments(), &inner);
+        let sender = socket.create_sender();
         Self(Arc::new(EndpointInner {
             shared: Shared {
                 incoming: Notify::new(),
@@ -698,6 +810,7 @@ impl EndpointRef {
             },
             state: Mutex::new(State {
                 socket,
+                sender,
                 prev_socket: None,
                 inner,
                 ipv6,
@@ -707,6 +820,8 @@ impl EndpointRef {
                 recv_state,
                 runtime,
                 stats: EndpointStats::default(),
+                default_client_config: None,
+                pending_accepts: 0,
             }),
         }))
     }
@@ -746,6 +861,8 @@ struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
     recv_buf: Box<[u8]>,
+    /// Reused buffer that received datagrams are copied into and split into owned slices.
+    datagrams: BytesMut,
     recv_limiter: WorkLimiter,
 }
 
@@ -755,12 +872,10 @@ impl RecvState {
         max_receive_segments: usize,
         endpoint: &proto::Endpoint,
     ) -> Self {
-        let recv_buf = vec![
-            0;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * max_receive_segments
-                * BATCH_SIZE
-        ];
+        let datagram_capacity = endpoint.config().get_max_udp_payload_size().min(64 * 1024)
+            as usize
+            * max_receive_segments;
+        let recv_buf = vec![0; datagram_capacity * BATCH_SIZE];
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),
@@ -769,21 +884,23 @@ impl RecvState {
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
+            datagrams: BytesMut::with_capacity(datagram_capacity),
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
 
     fn poll_socket(
         &mut self,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         endpoint: &mut proto::Endpoint,
-        socket: &dyn AsyncUdpSocket,
+        socket: &mut dyn AsyncUdpSocket,
+        sender: &mut Pin<Box<dyn UdpSender>>,
         runtime: &dyn Runtime,
         now: Instant,
     ) -> Result<PollProgress, io::Error> {
         let mut received_connection_packet = false;
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
-        let mut iovs: [IoSliceMut; BATCH_SIZE] = {
+        let mut iovs: [IoSliceMut<'_>; BATCH_SIZE] = {
             let mut bufs = self
                 .recv_buf
                 .chunks_mut(self.recv_buf.len() / BATCH_SIZE)
@@ -798,8 +915,21 @@ impl RecvState {
             match socket.poll_recv(cx, &mut iovs, &mut metas) {
                 Poll::Ready(Ok(msgs)) => {
                     self.recv_limiter.record_work(msgs);
+                    // Copy the received batch into `datagrams` and split each datagram off as
+                    // an owned slice. We can't read directly into `datagrams` and drop
+                    // `recv_buf`: once a slice has been handed to a connection the allocation
+                    // is shared, so the next `reserve` must allocate fresh backing memory.
+                    // Reading in place would therefore mean reserving the worst-case iovec
+                    // envelope before every poll and reallocating it whenever a prior datagram
+                    // is still in flight. `recv_buf` stays an allocate-once scratch buffer, and
+                    // we reserve only the bytes actually received.
+                    let batch_len = metas.iter().take(msgs).map(|meta| meta.len).sum();
+                    self.datagrams.reserve(batch_len);
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
-                        let mut data: BytesMut = buf[0..meta.len].into();
+                        self.datagrams.extend_from_slice(&buf[..meta.len]);
+                    }
+                    for meta in metas.iter().take(msgs) {
+                        let mut data = self.datagrams.split_to(meta.len);
                         while !data.is_empty() {
                             let buf = data.split_to(meta.stride.min(data.len()));
                             let mut response_buffer = Vec::new();
@@ -817,7 +947,7 @@ impl RecvState {
                                     } else {
                                         let transmit =
                                             endpoint.refuse(incoming, &mut response_buffer);
-                                        respond(transmit, &response_buffer, socket);
+                                        respond(transmit, &response_buffer, sender);
                                     }
                                 }
                                 Some(DatagramEvent::ConnectionEvent(handle, event)) => {
@@ -831,7 +961,7 @@ impl RecvState {
                                         .send(ConnectionEvent::Proto(event));
                                 }
                                 Some(DatagramEvent::Response(transmit)) => {
-                                    respond(transmit, &response_buffer, socket);
+                                    respond(transmit, &response_buffer, sender);
                                 }
                                 None => {}
                             }
@@ -846,8 +976,15 @@ impl RecvState {
                 }
                 // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
                 // attacker
-                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
-                    continue;
+                Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    self.recv_limiter.record_work(1);
+                }
+                // Ignore EMSGSIZE as we're currently not handling ICMPv4 Fragmentation Needed
+                // and ICMPv6 Packet Too Big (PTB) messages since they cannot be authenticated,
+                // and Datagram Packetization Layer Path MTU Discovery (DPLPMTUD) works without
+                // it anyways.
+                Poll::Ready(Err(e)) if is_msg_size_err(&e) => {
+                    self.recv_limiter.record_work(1);
                 }
                 Poll::Ready(Err(e)) => {
                     return Err(e);
@@ -864,7 +1001,7 @@ impl RecvState {
 }
 
 impl fmt::Debug for RecvState {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecvState")
             .field("incoming", &self.incoming)
             .field("connections", &self.connections)
@@ -880,4 +1017,110 @@ struct PollProgress {
     received_connection_packet: bool,
     /// Whether datagram handling was interrupted early by the work limiter for fairness
     keep_going: bool,
+}
+
+#[cfg(all(
+    test,
+    any(unix, windows),
+    feature = "runtime-tokio",
+    any(feature = "ring", feature = "aws-lc-rs")
+))]
+mod tests {
+    use std::net::UdpSocket;
+
+    use udp::Transmit;
+
+    use super::*;
+    use crate::runtime::TokioRuntime;
+
+    #[test]
+    fn ignored_receive_errors_respect_work_budget() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let size_error = socket
+            .send_to(&vec![0; 65_536], socket.local_addr().unwrap())
+            .unwrap_err();
+        assert!(is_msg_size_err(&size_error));
+
+        for error in [io::ErrorKind::ConnectionReset.into(), size_error] {
+            let mut endpoint =
+                proto::Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut state = RecvState::new(tx, 1, &endpoint);
+            let now = Instant::now();
+
+            // Calibrate the next receive cycles to allow two work items each.
+            state.recv_limiter.start_cycle(|| now);
+            state.recv_limiter.record_work(2);
+            state.recv_limiter.finish_cycle(|| now + RECV_TIME_BOUND);
+
+            let mut socket = ErrorSocket {
+                error,
+                remaining: 5,
+            };
+            let mut sender = socket.create_sender();
+            let mut cx = Context::from_waker(Waker::noop());
+            for (remaining, keep_going) in [(3, true), (1, true), (0, false)] {
+                state.recv_limiter.start_cycle(|| now);
+                let progress = state
+                    .poll_socket(
+                        &mut cx,
+                        &mut endpoint,
+                        &mut socket,
+                        &mut sender,
+                        &TokioRuntime,
+                        now,
+                    )
+                    .unwrap();
+                state.recv_limiter.finish_cycle(|| now);
+                assert_eq!(socket.remaining, remaining);
+                assert_eq!(progress.keep_going, keep_going);
+                assert!(!progress.received_connection_packet);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ErrorSocket {
+        error: io::Error,
+        remaining: usize,
+    }
+
+    impl AsyncUdpSocket for ErrorSocket {
+        fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+            Box::pin(UnusedSender)
+        }
+
+        fn poll_recv(
+            &mut self,
+            _cx: &mut Context<'_>,
+            _bufs: &mut [IoSliceMut<'_>],
+            _meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            if self.remaining == 0 {
+                return Poll::Pending;
+            }
+            self.remaining -= 1;
+            Poll::Ready(Err(match self.error.raw_os_error() {
+                Some(code) => io::Error::from_raw_os_error(code),
+                None => self.error.kind().into(),
+            }))
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnusedSender;
+
+    impl UdpSender for UnusedSender {
+        fn poll_send(
+            self: Pin<&mut Self>,
+            _transmit: &Transmit<'_>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            unreachable!("ignored receive errors must not produce responses")
+        }
+    }
 }

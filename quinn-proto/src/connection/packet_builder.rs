@@ -128,7 +128,7 @@ impl PacketBuilder {
             buffer[partial_encode.start] ^= FIXED_BIT;
         }
 
-        let (sample_size, tag_len) = if let Some(ref crypto) = space.crypto {
+        let (sample_size, tag_len) = if let Some(crypto) = &space.crypto {
             (
                 crypto.header.local.sample_size(),
                 crypto.packet.local.tag_len(),
@@ -213,9 +213,8 @@ impl PacketBuilder {
         let exact_number = self.exact_number;
         let space_id = self.space;
         let (size, padded) = self.finish(conn, now, buffer);
-        let sent = match sent {
-            Some(sent) => sent,
-            None => return,
+        let Some(sent) = sent else {
+            return;
         };
 
         let size = match padded || ack_eliciting {
@@ -264,7 +263,7 @@ impl PacketBuilder {
         }
 
         let space = &conn.spaces[self.space];
-        let (header_crypto, packet_crypto) = if let Some(ref crypto) = space.crypto {
+        let (header_crypto, packet_crypto) = if let Some(crypto) = &space.crypto {
             (&*crypto.header.local, &*crypto.packet.local)
         } else if self.space == SpaceId::Data {
             let zero_rtt = conn.zero_rtt_crypto.as_ref().unwrap();

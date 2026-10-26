@@ -33,10 +33,7 @@ impl Datagrams<'_> {
             .max_size()
             .ok_or(SendDatagramError::UnsupportedByPeer)?;
         let send_buffer_size = self.conn.config.datagram_send_buffer_size;
-        let Some(max_buffer_payload) = send_buffer_size.checked_sub(size_of::<Datagram>()) else {
-            return Err(SendDatagramError::TooLarge);
-        };
-        if data.len() > Ord::min(max, max_buffer_payload) {
+        if data.len() > Ord::min(max, send_buffer_size) {
             return Err(SendDatagramError::TooLarge);
         }
         if drop {
@@ -108,7 +105,7 @@ impl Datagrams<'_> {
         self.conn
             .config
             .datagram_send_buffer_size
-            .saturating_sub(self.conn.datagrams.outgoing.memory_used())
+            .saturating_sub(self.conn.datagrams.outgoing.payload_bytes)
             .saturating_sub(size_of::<Datagram>())
     }
 }
@@ -138,7 +135,9 @@ impl DatagramState {
         let size_with_overhead = datagram.data.len() + size_of::<Datagram>();
 
         if size_with_overhead > window {
-            return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
+            // A valid frame can still exceed the local memory budget because of queue metadata.
+            debug!("dropping datagram exceeding receive memory budget");
+            return Ok(false);
         }
 
         let was_empty = self.incoming.is_empty();
@@ -161,12 +160,7 @@ impl DatagramState {
     }
 
     fn has_send_buffer_space(&self, datagram_len: usize, send_buffer_size: usize) -> bool {
-        let Some(total) = self
-            .outgoing
-            .memory_used()
-            .checked_add(datagram_len)
-            .and_then(|total| total.checked_add(size_of::<Datagram>()))
-        else {
+        let Some(total) = self.outgoing.memory_used().checked_add(datagram_len) else {
             return false;
         };
 
@@ -202,9 +196,8 @@ impl DatagramState {
     /// Returns whether a frame was written. At most `max_size` bytes will be written, including
     /// framing.
     pub(super) fn write(&mut self, buf: &mut Vec<u8>, max_size: usize) -> bool {
-        let datagram = match self.outgoing.pop_front() {
-            Some(x) => x,
-            None => return false,
+        let Some(datagram) = self.outgoing.pop_front() else {
+            return false;
         };
 
         if buf.len() + datagram.size(true) > max_size {
@@ -275,6 +268,7 @@ mod tests {
         state.outgoing.push_back(Datagram {
             data: Bytes::from_static(&[0; 2]),
         });
+
         state.make_space_for(4, 10 + 2 * size_of::<Datagram>());
 
         assert_eq!(state.outgoing.queue.len(), 1);
@@ -297,24 +291,19 @@ mod tests {
     }
 
     #[test]
-    fn make_space_for_accounts_for_empty_datagram_metadata() {
+    fn empty_frame_flood_limit() {
         let mut state = DatagramState::default();
-        for _ in 0..2 {
-            state.outgoing.push_back(Datagram { data: Bytes::new() });
+        let datagram = Datagram { data: Bytes::new() };
+        let window = 100;
+        loop {
+            let initial_count = state.incoming.queue.len();
+            state.received(datagram.clone(), &Some(window)).unwrap();
+            assert!(state.incoming.queue.len() * size_of::<Datagram>() <= window);
+            if state.incoming.queue.len() == initial_count {
+                // Datagrams are getting dropped
+                break;
+            }
         }
-        let window = 2 * size_of::<Datagram>();
-
-        assert!(!state.has_send_buffer_space(0, window));
-        state.make_space_for(0, window);
-        assert_eq!(state.outgoing.queue.len(), 1);
-        assert!(state.has_send_buffer_space(0, window));
-        state.outgoing.push_back(Datagram { data: Bytes::new() });
-        assert_eq!(state.outgoing.memory_used(), window);
-    }
-
-    #[test]
-    fn send_buffer_space_handles_metadata_overflow() {
-        assert!(!DatagramState::default().has_send_buffer_space(usize::MAX, usize::MAX));
     }
 
     #[test]

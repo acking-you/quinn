@@ -3,12 +3,12 @@ use std::sync::Arc;
 use bytes::BytesMut;
 
 use quinn_proto::{
-    ConnectionId, Side, TransportError,
     crypto::{
-        self, CryptoError,
+        self,
         rustls::{QuicClientConfig, QuicServerConfig},
+        CryptoError,
     },
-    transport_parameters,
+    transport_parameters, ConnectionId, Side, TransportError,
 };
 
 /// A rustls TLS session which does not perform packet encryption/decryption (for debugging purpose)
@@ -64,7 +64,7 @@ impl NoProtectionServerConfig {
 
 // forward all calls to inner except those related to packet encryption/decryption
 impl crypto::Session for NoProtectionSession {
-    fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> crypto::Keys {
+    fn initial_keys(&self, dst_cid: ConnectionId, side: Side) -> crypto::Keys {
         self.inner.initial_keys(dst_cid, side)
     }
 
@@ -115,7 +115,7 @@ impl crypto::Session for NoProtectionSession {
         Some(Self::wrap_packet_keys(keys))
     }
 
-    fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool {
+    fn is_valid_retry(&self, orig_dst_cid: ConnectionId, header: &[u8], payload: &[u8]) -> bool {
         self.inner.is_valid_retry(orig_dst_cid, header, payload)
     }
 
@@ -131,7 +131,7 @@ impl crypto::Session for NoProtectionSession {
 
 impl crypto::ClientConfig for NoProtectionClientConfig {
     fn start_session(
-        self: std::sync::Arc<Self>,
+        self: Arc<Self>,
         version: u32,
         server_name: &str,
         params: &transport_parameters::TransportParameters,
@@ -149,12 +149,12 @@ impl crypto::ServerConfig for NoProtectionServerConfig {
     fn initial_keys(
         &self,
         version: u32,
-        dst_cid: &ConnectionId,
+        dst_cid: ConnectionId,
     ) -> Result<crypto::Keys, crypto::UnsupportedVersion> {
         self.inner.initial_keys(version, dst_cid)
     }
 
-    fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
+    fn retry_tag(&self, version: u32, orig_dst_cid: ConnectionId, packet: &[u8]) -> [u8; 16] {
         self.inner.retry_tag(version, orig_dst_cid, packet)
     }
 

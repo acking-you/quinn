@@ -7,9 +7,9 @@ use clap::{Parser, ValueEnum};
 #[cfg(feature = "qlog")]
 use quinn::QlogConfig;
 use quinn::{
-    AckFrequencyConfig, TransportConfig, VarInt,
     congestion::{self, ControllerFactory},
     udp::UdpSocketState,
+    AckFrequencyConfig, TransportConfig, VarInt,
 };
 use rustls::crypto::ring::cipher_suite;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -207,9 +207,9 @@ pub enum CongestionAlgorithm {
 impl CongestionAlgorithm {
     pub fn build(self) -> Arc<dyn ControllerFactory + Send + Sync + 'static> {
         match self {
-            CongestionAlgorithm::Cubic => Arc::new(congestion::CubicConfig::default()),
-            CongestionAlgorithm::Bbr => Arc::new(congestion::BbrConfig::default()),
-            CongestionAlgorithm::NewReno => Arc::new(congestion::NewRenoConfig::default()),
+            Self::Cubic => Arc::new(congestion::CubicConfig::default()),
+            Self::Bbr => Arc::new(congestion::BbrConfig::default()),
+            Self::NewReno => Arc::new(congestion::NewRenoConfig::default()),
         }
     }
 }

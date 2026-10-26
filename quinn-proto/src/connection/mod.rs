@@ -18,10 +18,10 @@ use crate::{
     Dir, Duration, EndpointConfig, Frame, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
     MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
     TransportErrorCode, VarInt,
-    cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
     config::{ServerConfig, TransportConfig},
+    connection::spaces::LostPacket,
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
@@ -67,6 +67,7 @@ pub(crate) mod qlog;
 
 mod send_buffer;
 
+mod sent_packets;
 mod spaces;
 #[cfg(fuzzing)]
 pub use spaces::Retransmits;
@@ -200,6 +201,9 @@ pub struct Connection {
     timers: TimerTable,
     /// Number of packets received which could not be authenticated
     authentication_failures: u64,
+    /// Authenticated 1-RTT packets that arrived before the handshake completed, to be processed
+    /// once it has
+    early_1rtt: Vec<EarlyPacket>,
     /// Why the connection was lost, if it has been
     error: Option<ConnectionError>,
     /// Identifies Data-space packet numbers to skip. Not used in earlier spaces.
@@ -248,28 +252,29 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub(crate) fn new(
-        endpoint_config: Arc<EndpointConfig>,
-        config: Arc<TransportConfig>,
-        init_cid: ConnectionId,
-        loc_cid: ConnectionId,
-        rem_cid: ConnectionId,
-        remote: SocketAddr,
-        local_ip: Option<IpAddr>,
-        crypto: Box<dyn crypto::Session>,
-        cid_gen: &dyn ConnectionIdGenerator,
-        now: Instant,
-        version: u32,
-        allow_mtud: bool,
-        rng_seed: [u8; 32],
-        side_args: SideArgs,
-    ) -> Self {
+    pub(crate) fn new(crypto: Box<dyn crypto::Session>, args: ConnectionArgs) -> Self {
+        let ConnectionArgs {
+            endpoint_config,
+            transport_config: config,
+            init_cid,
+            loc_cid,
+            rem_cid,
+            remote,
+            local_ip,
+            local_cid_len,
+            local_cid_lifetime,
+            now,
+            version,
+            allow_mtud,
+            rng_seed,
+            side_args,
+        } = args;
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
         let initial_space = PacketSpace {
-            crypto: Some(crypto.initial_keys(&init_cid, side)),
+            crypto: Some(crypto.initial_keys(init_cid, side)),
             ..PacketSpace::new(now)
         };
         let state = State::Handshake(state::Handshake {
@@ -284,8 +289,8 @@ impl Connection {
             handshake_cid: loc_cid,
             rem_handshake_cid: rem_cid,
             local_cid_state: CidState::new(
-                cid_gen.cid_len(),
-                cid_gen.cid_lifetime(),
+                local_cid_len,
+                local_cid_lifetime,
                 now,
                 if pref_addr_cid.is_some() { 2 } else { 1 },
             ),
@@ -326,6 +331,7 @@ impl Connection {
             },
             timers: TimerTable::default(),
             authentication_failures: 0,
+            early_1rtt: Vec::new(),
             error: None,
             #[cfg(test)]
             packet_number_filter: match config.deterministic_packet_numbers {
@@ -383,7 +389,7 @@ impl Connection {
     /// - a call to `poll_transmit` returned `Some`
     /// - a call was made to `handle_timeout`
     #[must_use]
-    pub fn poll_timeout(&mut self) -> Option<Instant> {
+    pub fn poll_timeout(&self) -> Option<Instant> {
         self.timers.next_timeout()
     }
 
@@ -483,9 +489,24 @@ impl Connection {
 
         // If we need to send a probe, make sure we have something to send.
         for space in SpaceId::iter() {
-            let request_immediate_ack =
-                space == SpaceId::Data && self.peer_supports_ack_frequency();
-            self.spaces[space].maybe_queue_probe(request_immediate_ack, &self.streams);
+            if space != SpaceId::Data {
+                self.spaces[space].maybe_queue_probe(false, false, &self.streams);
+                continue;
+            }
+
+            let has_ack_eliciting_data =
+                self.can_send_1rtt(Ord::min(segment_size, usize::from(min_mtu)).saturating_sub(
+                    self.predict_1rtt_overhead(Some(
+                        self.packet_number_filter.peek(&self.spaces[SpaceId::Data]),
+                    )),
+                ));
+            let request_immediate_ack = self.peer_supports_ack_frequency();
+
+            self.spaces[space].maybe_queue_probe(
+                request_immediate_ack,
+                has_ack_eliciting_data,
+                &self.streams,
+            );
         }
 
         // Check whether we need to send a close message
@@ -569,7 +590,7 @@ impl Connection {
                 buf.len()
             };
 
-            let tag_len = if let Some(ref crypto) = self.spaces[space_id].crypto {
+            let tag_len = if let Some(crypto) = &self.spaces[space_id].crypto {
                 crypto.packet.local.tag_len()
             } else if space_id == SpaceId::Data {
                 self.zero_rtt_crypto.as_ref().expect(
@@ -602,8 +623,13 @@ impl Connection {
                 }
 
                 // Congestion control and pacing checks
-                // Tail loss probes must not be blocked by congestion, or a deadlock could arise
-                if ack_eliciting && self.spaces[space_id].loss_probes == 0 {
+                // Tail loss probes must not be blocked by congestion, or a deadlock could arise.
+                // Close packets contain only ACKs and CONNECTION_CLOSE, neither of which is
+                // congestion controlled, and must not be blocked either: `ack_eliciting` reflects
+                // pending frames that will never be sent once closing, and a closed connection no
+                // longer processes ACKs, so the window could never drain
+                // (see https://github.com/quinn-rs/quinn/issues/2785)
+                if ack_eliciting && self.spaces[space_id].loss_probes == 0 && !close {
                     // Assume the current packet will get padded to fill the segment
                     let untracked_bytes = if let Some(builder) = &builder_storage {
                         buf_capacity - builder.partial_encode.start
@@ -613,7 +639,7 @@ impl Connection {
                     debug_assert!(untracked_bytes <= segment_size as u64);
 
                     let bytes_to_send = segment_size as u64 + untracked_bytes;
-                    if self.path.in_flight.bytes + bytes_to_send >= self.path.congestion.window() {
+                    if self.path.in_flight.bytes + bytes_to_send > self.path.congestion.window() {
                         space_idx += 1;
                         congestion_blocked = true;
                         // We continue instead of breaking here in order to avoid
@@ -718,7 +744,7 @@ impl Connection {
                         // Clamp the datagram to at most the minimum MTU to ensure that loss probes
                         // can get through and enable recovery even if the path MTU has shrank
                         // unexpectedly.
-                        std::cmp::min(segment_size, usize::from(min_mtu))
+                        cmp::min(segment_size, usize::from(min_mtu))
                     }
                 };
                 buf_capacity += next_datagram_size_limit;
@@ -766,7 +792,7 @@ impl Connection {
                 // sends its first Handshake packet.
                 self.discard_space(now, SpaceId::Initial);
             }
-            if let Some(ref mut prev) = self.prev_crypto {
+            if let Some(prev) = &mut self.prev_crypto {
                 prev.update_unacked = false;
             }
 
@@ -813,8 +839,8 @@ impl Connection {
 
                 if buf.len() + frame::ConnectionClose::SIZE_BOUND <= builder.max_size {
                     let max_frame_size = builder.max_size - buf.len();
-                    match self.state {
-                        State::Closed(state::Closed { ref reason }) => {
+                    match &self.state {
+                        State::Closed(state::Closed { reason }) => {
                             if space_id == SpaceId::Data || reason.is_transport_layer() {
                                 reason.encode(buf, max_frame_size)
                             } else {
@@ -853,34 +879,35 @@ impl Connection {
 
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
-            if space_id == SpaceId::Data && num_datagrams == 1 {
-                if let Some((token, remote)) = self.path_responses.pop_off_path(self.path.remote) {
-                    // `unwrap` guaranteed to succeed because `builder_storage` was populated just
-                    // above.
-                    let mut builder = builder_storage.take().unwrap();
-                    trace!("PATH_RESPONSE {:08x} (off-path)", token);
-                    buf.write(frame::FrameType::PATH_RESPONSE);
-                    buf.write(token);
-                    self.stats.frame_tx.path_response += 1;
-                    builder.pad_to(MIN_INITIAL_SIZE);
-                    builder.finish_and_track(
-                        now,
-                        self,
-                        Some(SentFrames {
-                            non_retransmits: true,
-                            ..SentFrames::default()
-                        }),
-                        buf,
-                    );
-                    self.stats.udp_tx.on_sent(1, buf.len());
-                    return Some(Transmit {
-                        destination: remote,
-                        size: buf.len(),
-                        ecn: None,
-                        segment_size: None,
-                        src_ip: self.local_ip,
-                    });
-                }
+            if space_id == SpaceId::Data
+                && num_datagrams == 1
+                && let Some((token, remote)) = self.path_responses.pop_off_path(self.path.remote)
+            {
+                // `unwrap` guaranteed to succeed because `builder_storage` was populated just
+                // above.
+                let mut builder = builder_storage.take().unwrap();
+                trace!("PATH_RESPONSE {:08x} (off-path)", token);
+                buf.write(frame::FrameType::PATH_RESPONSE);
+                buf.write(token);
+                self.stats.frame_tx.path_response += 1;
+                builder.pad_to(MIN_INITIAL_SIZE);
+                builder.finish_and_track(
+                    now,
+                    self,
+                    Some(SentFrames {
+                        non_retransmits: true,
+                        ..SentFrames::default()
+                    }),
+                    buf,
+                );
+                self.stats.udp_tx.on_sent(1, buf.len());
+                return Some(Transmit {
+                    destination: remote,
+                    size: buf.len(),
+                    ecn: None,
+                    segment_size: None,
+                    src_ip: self.local_ip,
+                });
             }
 
             let sent =
@@ -1224,6 +1251,8 @@ impl Connection {
                     debug!("path validation failed");
                     if let Some((_, prev)) = self.prev_path.take() {
                         self.path = prev;
+                        self.set_loss_detection_timer(now);
+                        self.events.push_back(Event::PathUpdated);
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
@@ -1291,6 +1320,7 @@ impl Connection {
         stats.path.rtt = self.path.rtt.get();
         stats.path.min_rtt = self.path.rtt.min();
         stats.path.cwnd = self.path.congestion.window();
+        stats.path.bandwidth_estimate = self.path.congestion.metrics().bandwidth_estimate;
         stats.path.current_mtu = self.path.mtud.current_mtu();
 
         stats
@@ -1320,13 +1350,6 @@ impl Connection {
         self.update_keys(None, false);
     }
 
-    // Compatibility wrapper for quinn < 0.11.7. Remove for 0.12.
-    #[doc(hidden)]
-    #[deprecated]
-    pub fn initiate_key_update(&mut self) {
-        self.force_key_update();
-    }
-
     /// Get a session reference
     pub fn crypto_session(&self) -> &dyn crypto::Session {
         &*self.crypto
@@ -1335,7 +1358,9 @@ impl Connection {
     /// Whether the connection is in the process of being established
     ///
     /// If this returns `false`, the connection may be either established or closed, signaled by the
-    /// emission of a `Connected` or `ConnectionLost` message respectively.
+    /// emission of a [`Connected`](Event::Connected) or [`ConnectionLost`](Event::ConnectionLost)
+    /// event respectively. Note that locally-initiated closes via [`close()`](Self::close) do not
+    /// emit a `ConnectionLost` event.
     pub fn is_handshaking(&self) -> bool {
         self.state.is_handshake()
     }
@@ -1346,7 +1371,10 @@ impl Connection {
     /// either peer application intentionally closes it, or when either transport layer detects an
     /// error such as a time-out or certificate validation failure.
     ///
-    /// A `ConnectionLost` event is emitted with details when the connection becomes closed.
+    /// A [`ConnectionLost`](Event::ConnectionLost) event is emitted with details when the
+    /// connection is closed by the peer or due to an error. When the local application closes
+    /// the connection via [`close()`](Self::close), no `ConnectionLost` event is emitted;
+    /// instead, pending operations fail with [`ConnectionError::LocallyClosed`].
     pub fn is_closed(&self) -> bool {
         self.state.is_closed()
     }
@@ -1475,7 +1503,7 @@ impl Connection {
             let space = &mut self.spaces[space];
             if space.largest_acked_packet.is_none_or(|pn| ack.largest > pn) {
                 space.largest_acked_packet = Some(ack.largest);
-                if let Some(info) = space.sent_packets.get(&ack.largest) {
+                if let Some(info) = space.sent_packets.get(ack.largest) {
                     // This should always succeed, but a misbehaving peer might ACK a packet we
                     // haven't sent. At worst, that will result in us spuriously reducing the
                     // congestion window.
@@ -1487,11 +1515,16 @@ impl Connection {
             }
         };
 
+        if self.detect_spurious_loss(&ack, space) {
+            self.stats.path.spurious_congestion_events += 1;
+            self.path.congestion.on_spurious_congestion_event();
+        }
+
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
         for range in ack.iter() {
             self.packet_number_filter.check_ack(space, range.clone())?;
-            for (&pn, _) in self.spaces[space].sent_packets.range(range) {
+            for (pn, _) in self.spaces[space].sent_packets.range(range) {
                 newly_acked.insert_one(pn);
             }
         }
@@ -1581,6 +1614,43 @@ impl Connection {
         Ok(())
     }
 
+    fn detect_spurious_loss(&mut self, ack: &frame::Ack, space: SpaceId) -> bool {
+        let lost_packets = &mut self.spaces[space].lost_packets;
+
+        if lost_packets.is_empty() {
+            return false;
+        }
+
+        for range in ack.iter() {
+            let spurious_losses: Vec<u64> = lost_packets
+                .range(range.clone())
+                .map(|(pn, _info)| pn)
+                .copied()
+                .collect();
+
+            for pn in spurious_losses {
+                lost_packets.remove(&pn);
+            }
+        }
+
+        // If this ACK frame acknowledged all deemed lost packets,
+        // then we have raised a spurious congestion event in the past.
+        // We cannot conclude when there are remaining packets,
+        // but future ACK frames might indicate a spurious loss detection.
+        lost_packets.is_empty()
+    }
+
+    /// Drain lost packets that we reasonably think will never arrive
+    ///
+    /// The current criterion is copied from `msquic`:
+    /// discard packets that were sent earlier than 2 probe timeouts ago.
+    fn drain_lost_packets(&mut self, now: Instant, space: SpaceId) {
+        let two_pto = 2 * self.path.rtt.pto_base();
+
+        let lost_packets = &mut self.spaces[space].lost_packets;
+        lost_packets.retain(|_pn, info| now.saturating_duration_since(info.time_sent) <= two_pto);
+    }
+
     /// Process a new ECN block from an in-order ACK
     fn process_ecn(
         &mut self,
@@ -1603,7 +1673,7 @@ impl Connection {
                 self.stats.path.congestion_events += 1;
                 self.path
                     .congestion
-                    .on_congestion_event(now, largest_sent_time, false, 0);
+                    .on_congestion_event(now, largest_sent_time, false, true, 0);
             }
         }
     }
@@ -1660,12 +1730,9 @@ impl Connection {
             return;
         }
 
-        let (_, space) = match self.pto_time_and_space(now) {
-            Some(x) => x,
-            None => {
-                error!("PTO expired while unset");
-                return;
-            }
+        let Some((_, space)) = self.pto_time_and_space(now) else {
+            error!("PTO expired while unset");
+            return;
         };
         trace!(
             in_flight = self.path.in_flight.bytes,
@@ -1703,8 +1770,9 @@ impl Connection {
         // InPersistentCongestion: Determine if all packets in the time period before the newest
         // lost packet, including the edges, are marked lost. PTO computation must always
         // include max ACK delay, i.e. operate as if in Data space (see RFC9001 §7.6.1).
-        let congestion_period =
-            self.pto(SpaceId::Data) * self.config.persistent_congestion_threshold;
+        let congestion_period = self
+            .pto(SpaceId::Data)
+            .saturating_mul(self.config.persistent_congestion_threshold);
         let mut persistent_congestion_start: Option<Instant> = None;
         let mut prev_packet = None;
         let mut in_persistent_congestion = false;
@@ -1712,7 +1780,7 @@ impl Connection {
         let space = &mut self.spaces[pn_space];
         space.loss_time = None;
 
-        for (&packet, info) in space.sent_packets.range(0..largest_acked_packet) {
+        for (packet, info) in space.sent_packets.range(0..largest_acked_packet) {
             if prev_packet != Some(packet.wrapping_sub(1)) {
                 // An intervening packet was acknowledged
                 persistent_congestion_start = None;
@@ -1762,10 +1830,17 @@ impl Connection {
             prev_packet = Some(packet);
         }
 
+        self.drain_lost_packets(now, pn_space);
+
         // OnPacketsLost
         if let Some(largest_lost) = lost_packets.last().cloned() {
             let old_bytes_in_flight = self.path.in_flight.bytes;
-            let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
+            // safe: lost_packets is populated just above
+            let largest_lost_sent = self.spaces[pn_space]
+                .sent_packets
+                .get(largest_lost)
+                .unwrap()
+                .time_sent;
             self.stats.path.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_bytes += size_of_lost_packets;
             trace!(
@@ -1783,12 +1858,20 @@ impl Connection {
                     now,
                     self.orig_rem_cid,
                 );
+
                 self.remove_in_flight(&info);
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
                 self.path.mtud.on_non_probe_lost(packet, info.size);
+
+                self.spaces[pn_space].lost_packets.insert(
+                    packet,
+                    LostPacket {
+                        time_sent: info.time_sent,
+                    },
+                );
             }
 
             if self.path.mtud.black_hole_detected(now) {
@@ -1808,6 +1891,7 @@ impl Connection {
                     now,
                     largest_lost_sent,
                     in_persistent_congestion,
+                    false,
                     size_of_lost_packets,
                 );
             }
@@ -1854,9 +1938,9 @@ impl Connection {
                 // Include max_ack_delay and backoff for ApplicationData.
                 duration += self.ack_frequency.max_ack_delay_for_pto() * backoff;
             }
-            let last_ack_eliciting = match self.spaces[space].time_of_last_ack_eliciting_packet {
-                Some(time) => time,
-                None => continue,
+            let Some(last_ack_eliciting) = self.spaces[space].time_of_last_ack_eliciting_packet
+            else {
+                continue;
             };
             let pto = last_ack_eliciting + duration;
             if result.is_none_or(|(earliest_pto, _)| pto < earliest_pto) {
@@ -1948,9 +2032,8 @@ impl Connection {
             }
         }
 
-        let packet = match packet {
-            Some(x) => x,
-            None => return,
+        let Some(packet) = packet else {
+            return;
         };
         if self.side.is_server() {
             if self.spaces[SpaceId::Initial].crypto.is_some() && space_id == SpaceId::Handshake {
@@ -1980,9 +2063,8 @@ impl Connection {
     }
 
     fn reset_idle_timeout(&mut self, now: Instant, space: SpaceId) {
-        let timeout = match self.idle_timeout {
-            None => return,
-            Some(dur) => dur,
+        let Some(timeout) = self.idle_timeout else {
+            return;
         };
         if self.state.is_closed() {
             self.timers.stop(Timer::Idle);
@@ -2025,8 +2107,8 @@ impl Connection {
         let len = packet.header_data.len() + packet.payload.len();
         self.path.total_recvd = len as u64;
 
-        match self.state {
-            State::Handshake(ref mut state) => {
+        match &mut self.state {
+            State::Handshake(state) => {
                 state.expected_token = packet.header.token.clone();
             }
             _ => unreachable!("first packet must be delivered in Handshake state"),
@@ -2057,9 +2139,8 @@ impl Connection {
     }
 
     fn init_0rtt(&mut self) {
-        let (header, packet) = match self.crypto.early_crypto() {
-            Some(x) => x,
-            None => return,
+        let Some((header, packet)) = self.crypto.early_crypto() else {
+            return;
         };
         if self.side.is_client() {
             match self.crypto.transport_parameters() {
@@ -2168,10 +2249,12 @@ impl Connection {
             }
             let offset = self.spaces[space].crypto_offset;
             let outgoing = Bytes::from(outgoing);
-            if let State::Handshake(ref mut state) = self.state {
-                if space == SpaceId::Initial && offset == 0 && self.side.is_client() {
-                    state.client_hello = Some(outgoing.clone());
-                }
+            if let State::Handshake(state) = &mut self.state
+                && space == SpaceId::Initial
+                && offset == 0
+                && self.side.is_client()
+            {
+                state.client_hello = Some(outgoing.clone());
             }
             self.spaces[space].crypto_offset += outgoing.len() as u64;
             trace!("wrote {} {:?} CRYPTO bytes", outgoing.len(), space);
@@ -2281,7 +2364,7 @@ impl Connection {
         stateless_reset: bool,
     ) {
         self.stats.udp_rx.ios += 1;
-        if let Some(ref packet) = packet {
+        if let Some(packet) = &packet {
             trace!(
                 "got {:?} packet ({} bytes) from {} using id {}",
                 packet.header.space(),
@@ -2342,44 +2425,110 @@ impl Connection {
                     debug!("discarding possible duplicate packet");
                     return;
                 } else if self.state.is_handshake() && packet.header.is_short() {
-                    // TODO: SHOULD buffer these to improve reordering tolerance.
-                    trace!("dropping short packet during handshake");
-                    return;
-                } else {
-                    if let Header::Initial(InitialHeader { ref token, .. }) = packet.header {
-                        if let State::Handshake(ref hs) = self.state {
-                            if self.side.is_server() && token != &hs.expected_token {
-                                // Clients must send the same retry token in every Initial. Initial
-                                // packets can be spoofed, so we discard rather than killing the
-                                // connection.
-                                warn!("discarding Initial with invalid retry token");
-                                return;
-                            }
-                        }
-                    }
-
-                    if !self.state.is_closed() {
-                        let spin = match packet.header {
-                            Header::Short { spin, .. } => spin,
-                            _ => false,
-                        };
-                        self.on_packet_authenticated(
-                            now,
-                            packet.header.space(),
+                    // A server has 1-RTT keys before the handshake completes, but must not
+                    // process 1-RTT packets until it does (RFC 9001 section 5.7). A client's
+                    // first 1-RTT packets, such as a request sent right after its Finished, can
+                    // overtake the Finished, so keep a few instead of making the client wait for
+                    // a retransmission.
+                    if let Some(number) = number
+                        && self.early_1rtt.len() < MAX_EARLY_1RTT_PACKETS
+                    {
+                        trace!("buffering short packet during handshake");
+                        self.early_1rtt.push(EarlyPacket {
+                            remote,
                             ecn,
                             number,
-                            spin,
-                            packet.header.is_1rtt(),
-                        );
+                            packet,
+                        });
+                    } else {
+                        trace!("dropping short packet during handshake");
+                    }
+                    return;
+                } else {
+                    if let Header::Initial(InitialHeader { token, .. }) = &packet.header
+                        && let State::Handshake(hs) = &self.state
+                        && self.side.is_server()
+                        && token != &hs.expected_token
+                    {
+                        // Clients must send the same retry token in every Initial. Initial
+                        // packets can be spoofed, so we discard rather than killing the
+                        // connection.
+                        warn!("discarding Initial with invalid retry token");
+                        return;
                     }
 
-                    self.process_decrypted_packet(now, remote, number, packet)
+                    self.process_authenticated_packet(now, remote, ecn, number, packet)
                 }
             }
         };
 
+        self.finish_packet(now, remote, result, was_closed, was_drained);
+
+        if !self.state.is_handshake() {
+            // The handshake is over. Process the 1-RTT packets that arrived during it, in order.
+            for early in mem::take(&mut self.early_1rtt) {
+                if self.state.is_closed() {
+                    break;
+                }
+                let _guard =
+                    trace_span!("recv", space = ?SpaceId::Data, pn = early.number).entered();
+                trace!("processing short packet buffered during handshake");
+                let was_closed = self.state.is_closed();
+                let was_drained = self.state.is_drained();
+                let result = self.process_authenticated_packet(
+                    now,
+                    early.remote,
+                    early.ecn,
+                    Some(early.number),
+                    early.packet,
+                );
+                self.finish_packet(now, early.remote, result, was_closed, was_drained);
+            }
+        }
+    }
+
+    /// Process a packet that has been decrypted and authenticated
+    fn process_authenticated_packet(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        number: Option<u64>,
+        packet: Packet,
+    ) -> Result<(), ConnectionError> {
+        if !self.state.is_closed() {
+            let spin = match packet.header {
+                Header::Short { spin, .. } => spin,
+                _ => false,
+            };
+            self.on_packet_authenticated(
+                now,
+                packet.header.space(),
+                ecn,
+                number,
+                spin,
+                packet.header.is_1rtt(),
+            );
+        }
+        self.process_decrypted_packet(now, remote, number, packet)
+    }
+
+    /// Apply the state transitions that follow processing a packet
+    fn finish_packet(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        result: Result<(), ConnectionError>,
+        was_closed: bool,
+        was_drained: bool,
+    ) {
         // State transitions for error cases
-        if let Err(conn_err) = result {
+        if let Err(ConnectionError::Reset) = result
+            && matches!(self.state, State::Draining | State::Drained)
+        {
+            // Preserve the original close reason once draining has begun.
+            self.state = State::Drained;
+        } else if let Err(conn_err) = result {
             self.error = Some(conn_err.clone());
             self.state = match conn_err {
                 ConnectionError::ApplicationClosed(reason) => State::closed(reason),
@@ -2432,7 +2581,7 @@ impl Connection {
         number: Option<u64>,
         packet: Packet,
     ) -> Result<(), ConnectionError> {
-        let state = match self.state {
+        let state = match &mut self.state {
             State::Established => {
                 match packet.header.space() {
                     SpaceId::Data => self.process_payload(now, remote, number.unwrap(), packet)?,
@@ -2468,7 +2617,7 @@ impl Connection {
                 return Ok(());
             }
             State::Draining | State::Drained => return Ok(()),
-            State::Handshake(ref mut state) => state,
+            State::Handshake(state) => state,
         };
 
         match packet.header {
@@ -2482,10 +2631,11 @@ impl Connection {
                 if self.total_authed_packets > 1
                             || packet.payload.len() <= 16 // token + 16 byte tag
                             || !self.crypto.is_valid_retry(
-                                &self.rem_cids.active(),
+                                self.rem_cids.active(),
                                 &packet.header_data,
                                 &packet.payload,
                             )
+                            || rem_cid == self.initial_dst_cid
                 {
                     trace!("discarding invalid Retry");
                     // - After the client has received and processed an Initial or Retry
@@ -2511,7 +2661,7 @@ impl Connection {
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
                 self.spaces[SpaceId::Initial] = PacketSpace {
-                    crypto: Some(self.crypto.initial_keys(&rem_cid, self.side.side())),
+                    crypto: Some(self.crypto.initial_keys(rem_cid, self.side.side())),
                     next_packet_number: self.spaces[SpaceId::Initial].next_packet_number,
                     crypto_offset: client_hello.len() as u64,
                     ..PacketSpace::new(now)
@@ -2533,7 +2683,7 @@ impl Connection {
                 self.streams.retransmit_all_for_0rtt();
 
                 let token_len = packet.payload.len() - 16;
-                let ConnectionSide::Client { ref mut token, .. } = self.side else {
+                let ConnectionSide::Client { token, .. } = &mut self.side else {
                     unreachable!("we already short-circuited if we're server");
                 };
                 *token = packet.payload.freeze().split_to(token_len);
@@ -2570,14 +2720,12 @@ impl Connection {
 
                 if self.side.is_client() {
                     // Client-only because server params were set from the client's Initial
-                    let params =
-                        self.crypto
-                            .transport_parameters()?
-                            .ok_or_else(|| TransportError {
-                                code: TransportErrorCode::crypto(0x6d),
-                                frame: None,
-                                reason: "transport parameters missing".into(),
-                            })?;
+                    let params = self.crypto.transport_parameters()?.ok_or_else(|| {
+                        TransportError::new(
+                            TransportErrorCode::crypto(0x6d),
+                            "transport parameters missing".to_owned(),
+                        )
+                    })?;
 
                     if self.has_0rtt() {
                         if !self.crypto.early_data_accepted().unwrap() {
@@ -2610,6 +2758,8 @@ impl Connection {
                     // Server-only
                     self.spaces[SpaceId::Data].pending.handshake_done = true;
                     self.discard_space(now, SpaceId::Handshake);
+                    self.events.push_back(Event::HandshakeConfirmed);
+                    trace!("handshake confirmed");
                 }
 
                 self.events.push_back(Event::Connected);
@@ -2643,14 +2793,12 @@ impl Connection {
                     && starting_space == SpaceId::Initial
                     && self.highest_space != SpaceId::Initial
                 {
-                    let params =
-                        self.crypto
-                            .transport_parameters()?
-                            .ok_or_else(|| TransportError {
-                                code: TransportErrorCode::crypto(0x6d),
-                                frame: None,
-                                reason: "transport parameters missing".into(),
-                            })?;
+                    let params = self.crypto.transport_parameters()?.ok_or_else(|| {
+                        TransportError::new(
+                            TransportErrorCode::crypto(0x6d),
+                            "transport parameters missing".to_owned(),
+                        )
+                    })?;
                     self.handle_peer_params(params)?;
                     self.issue_first_cids(now);
                     self.init_0rtt();
@@ -2717,7 +2865,10 @@ impl Connection {
                 Frame::Ack(ack) => {
                     self.on_ack_received(now, packet.header.space(), ack)?;
                 }
-                Frame::Close(reason) => {
+                // Per RFC 9000 §12.4 Table 3, only a CONNECTION_CLOSE frame of type 0x1c may
+                // appear in Initial or Handshake packets. An application close (0x1d) falls
+                // through to the catch-all arm below.
+                Frame::Close(reason @ Close::Connection(_)) => {
                     self.error = Some(reason.into());
                     self.state = State::Draining;
                     return Ok(());
@@ -2754,7 +2905,8 @@ impl Connection {
         let mut close = None;
         let payload_len = payload.len();
         let mut ack_eliciting = false;
-        for result in frame::Iter::new(payload)? {
+        let mut frames = frame::Iter::new(payload)?;
+        while let Some((result, frame_size)) = frames.next_with_size() {
             let frame = result?;
             let span = match frame {
                 Frame::Padding => continue,
@@ -2780,15 +2932,13 @@ impl Connection {
             }
 
             let _guard = span.as_ref().map(|x| x.enter());
-            if packet.header.is_0rtt() {
-                match frame {
-                    Frame::Crypto(_) | Frame::Close(Close::Application(_)) => {
-                        return Err(TransportError::PROTOCOL_VIOLATION(
-                            "illegal frame type in 0-RTT",
-                        ));
-                    }
-                    _ => {}
-                }
+            // RFC 9000 §12.5: CRYPTO frames cannot be sent in 0-RTT packets. Both
+            // CONNECTION_CLOSE types are permitted there, as 0-RTT belongs to the application
+            // data packet number space; see §12.4 Table 3.
+            if packet.header.is_0rtt() && matches!(frame, Frame::Crypto(_)) {
+                return Err(TransportError::PROTOCOL_VIOLATION(
+                    "illegal frame type in 0-RTT",
+                ));
             }
             ack_eliciting |= frame.is_ack_eliciting();
 
@@ -2835,7 +2985,7 @@ impl Connection {
                         self.timers.stop(Timer::PathValidation);
                         self.path.challenge = None;
                         self.path.validated = true;
-                        if let Some((_, ref mut prev_path)) = self.prev_path {
+                        if let Some((_, prev_path)) = &mut self.prev_path {
                             prev_path.challenge = None;
                             prev_path.challenge_pending = false;
                         }
@@ -2970,6 +3120,14 @@ impl Connection {
                     token_store.insert(server_name, token);
                 }
                 Frame::Datagram(datagram) => {
+                    // The transport parameter limits the encoded frame size, not its heap usage.
+                    if self
+                        .config
+                        .datagram_receive_buffer_size
+                        .is_some_and(|window| frame_size > window.min(u16::MAX.into()))
+                    {
+                        return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
+                    }
                     if self
                         .datagrams
                         .received(datagram, &self.config.datagram_receive_buffer_size)?
@@ -3013,6 +3171,8 @@ impl Connection {
                     if self.spaces[SpaceId::Handshake].crypto.is_some() {
                         self.discard_space(now, SpaceId::Handshake);
                     }
+                    self.events.push_back(Event::HandshakeConfirmed);
+                    trace!("handshake confirmed");
                 }
             }
         }
@@ -3044,7 +3204,7 @@ impl Connection {
             && !is_probing_packet
             && number == self.spaces[SpaceId::Data].rx_packet
         {
-            let ConnectionSide::Server { ref server_config } = self.side else {
+            let ConnectionSide::Server { server_config } = &self.side else {
                 panic!("packets from unknown remote should be dropped by clients");
             };
             debug_assert!(
@@ -3087,6 +3247,8 @@ impl Connection {
 
         let mut prev = mem::replace(&mut self.path, new_path);
         self.datagrams().drop_oversized();
+        self.events.push_back(Event::PathUpdated);
+
         // Don't clobber the original path if the previous one hasn't been validated yet
         if prev.challenge.is_none() {
             prev.challenge = Some(self.rng.random());
@@ -3110,9 +3272,8 @@ impl Connection {
 
     /// Switch to a previously unused remote connection ID, if possible
     fn update_rem_cid(&mut self) {
-        let (reset_token, retired) = match self.rem_cids.next() {
-            Some(x) => x,
-            None => return,
+        let Some((reset_token, retired)) = self.rem_cids.next() else {
+            return;
         };
 
         // Retire the current remote CID and any CIDs we had to skip.
@@ -3140,11 +3301,11 @@ impl Connection {
 
         // Subtract 1 to account for the CID we supplied while handshaking
         let mut n = self.peer_params.issue_cids_limit() - 1;
-        if let ConnectionSide::Server { server_config } = &self.side {
-            if server_config.has_preferred_address() {
-                // We also sent a CID in the transport parameters
-                n -= 1;
-            }
+        if let ConnectionSide::Server { server_config } = &self.side
+            && server_config.has_preferred_address()
+        {
+            // We also sent a CID in the transport parameters
+            n -= 1;
         }
         self.endpoint_events
             .push_back(EndpointEventInner::NeedIdentifiers(now, n));
@@ -3249,22 +3410,22 @@ impl Connection {
         }
 
         // PATH_RESPONSE
-        if buf.len() + 9 < max_size && space_id == SpaceId::Data {
-            if let Some(token) = self.path_responses.pop_on_path(self.path.remote) {
-                sent.non_retransmits = true;
-                sent.requires_padding = true;
-                trace!("PATH_RESPONSE {:08x}", token);
-                buf.write(frame::FrameType::PATH_RESPONSE);
-                buf.write(token);
-                self.stats.frame_tx.path_response += 1;
-            }
+        if buf.len() + 9 < max_size
+            && space_id == SpaceId::Data
+            && let Some(token) = self.path_responses.pop_on_path(self.path.remote)
+        {
+            sent.non_retransmits = true;
+            sent.requires_padding = true;
+            trace!("PATH_RESPONSE {:08x}", token);
+            buf.write(frame::FrameType::PATH_RESPONSE);
+            buf.write(token);
+            self.stats.frame_tx.path_response += 1;
         }
 
         // CRYPTO
         while buf.len() + frame::Crypto::SIZE_BOUND < max_size && !is_0rtt {
-            let mut frame = match space.pending.crypto.pop_front() {
-                Some(x) => x,
-                None => break,
+            let Some(mut frame) = space.pending.crypto.pop_front() else {
+                break;
             };
 
             // Calculate the maximum amount of crypto data we can store in the buffer.
@@ -3314,16 +3475,15 @@ impl Connection {
 
         // NEW_CONNECTION_ID
         while buf.len() + NewConnectionId::SIZE_BOUND < max_size {
-            let issued = match space.pending.new_cids.pop() {
-                Some(x) => x,
-                None => break,
+            let Some(issued) = space.pending.new_cids.pop() else {
+                break;
             };
             trace!(
                 sequence = issued.sequence,
                 id = %issued.id,
                 "NEW_CONNECTION_ID"
             );
-            frame::NewConnectionId {
+            NewConnectionId {
                 sequence: issued.sequence,
                 retire_prior_to: self.local_cid_state.retire_prior_to(),
                 id: issued.id,
@@ -3336,9 +3496,8 @@ impl Connection {
 
         // RETIRE_CONNECTION_ID
         while buf.len() + frame::RETIRE_CONNECTION_ID_SIZE_BOUND < max_size {
-            let seq = match space.pending.retire_cids.pop() {
-                Some(x) => x,
-                None => break,
+            let Some(seq) = space.pending.retire_cids.pop() else {
+                break;
             };
             trace!(sequence = seq, "RETIRE_CONNECTION_ID");
             buf.write(frame::FrameType::RETIRE_CONNECTION_ID);
@@ -3518,8 +3677,8 @@ impl Connection {
         self.idle_timeout =
             negotiate_max_idle_timeout(self.config.max_idle_timeout, Some(params.max_idle_timeout));
         trace!("negotiated max idle timeout {:?}", self.idle_timeout);
-        if let Some(ref info) = params.preferred_address {
-            self.rem_cids.insert(frame::NewConnectionId {
+        if let Some(info) = params.preferred_address {
+            self.rem_cids.insert(NewConnectionId {
                 sequence: 1,
                 id: info.connection_id,
                 reset_token: info.stateless_reset_token,
@@ -3547,16 +3706,15 @@ impl Connection {
             self.next_crypto.as_ref(),
         )?;
 
-        let result = match result {
-            Some(r) => r,
-            None => return Ok(None),
+        let Some(result) = result else {
+            return Ok(None);
         };
 
-        if result.outgoing_key_update_acked {
-            if let Some(prev) = self.prev_crypto.as_mut() {
-                prev.end_packet = Some((result.number, now));
-                self.set_key_discard_timer(now, packet.header.space());
-            }
+        if result.outgoing_key_update_acked
+            && let Some(prev) = self.prev_crypto.as_mut()
+        {
+            prev.end_packet = Some((result.number, now));
+            self.set_key_discard_timer(now, packet.header.space());
         }
 
         if result.incoming_key_update {
@@ -3602,6 +3760,11 @@ impl Connection {
         self.peer_params.min_ack_delay.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn disable_peer_ack_frequency(&mut self) {
+        self.peer_params.min_ack_delay = None;
+    }
+
     /// Send an IMMEDIATE_ACK frame to the remote endpoint
     ///
     /// According to the spec, this will result in an error if the remote endpoint does not support
@@ -3613,13 +3776,13 @@ impl Connection {
     /// Decodes a packet, returning its decrypted payload, so it can be inspected in tests
     #[cfg(test)]
     pub(crate) fn decode_packet(&self, event: &ConnectionEvent) -> Option<Vec<u8>> {
-        let (first_decode, remaining) = match &event.0 {
-            ConnectionEventInner::Datagram(DatagramConnectionEvent {
-                first_decode,
-                remaining,
-                ..
-            }) => (first_decode, remaining),
-            _ => return None,
+        let ConnectionEventInner::Datagram(DatagramConnectionEvent {
+            first_decode,
+            remaining,
+            ..
+        }) = &event.0
+        else {
+            return None;
         };
 
         if remaining.is_some() {
@@ -3801,7 +3964,7 @@ impl Connection {
 }
 
 impl fmt::Debug for Connection {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connection")
             .field("handshake_cid", &self.handshake_cid)
             .finish()
@@ -3863,6 +4026,27 @@ impl From<SideArgs> for ConnectionSide {
             } => Self::Server { server_config },
         }
     }
+}
+
+/// Parameters to `Connection::new` other than the TLS session
+pub(crate) struct ConnectionArgs {
+    pub(crate) endpoint_config: Arc<EndpointConfig>,
+    pub(crate) transport_config: Arc<TransportConfig>,
+    /// Destination CID of the first Initial packet sent by the client
+    pub(crate) init_cid: ConnectionId,
+    /// CID initially issued to the peer for addressing this connection
+    pub(crate) loc_cid: ConnectionId,
+    /// CID initially issued by the peer for addressing it
+    pub(crate) rem_cid: ConnectionId,
+    pub(crate) remote: SocketAddr,
+    pub(crate) local_ip: Option<IpAddr>,
+    pub(crate) local_cid_len: usize,
+    pub(crate) local_cid_lifetime: Option<Duration>,
+    pub(crate) now: Instant,
+    pub(crate) version: u32,
+    pub(crate) allow_mtud: bool,
+    pub(crate) rng_seed: [u8; 32],
+    pub(crate) side_args: SideArgs,
 }
 
 /// Parameters to `Connection::new` specific to it being client-side or server-side
@@ -3999,7 +4183,7 @@ impl State {
 mod state {
     use super::*;
 
-    #[allow(unreachable_pub)] // fuzzing only
+    #[allow(unnameable_types, unreachable_pub)] // fuzzing only
     #[derive(Clone)]
     pub struct Handshake {
         /// Whether the remote CID has been set by the peer yet
@@ -4016,7 +4200,7 @@ mod state {
         pub(super) client_hello: Option<Bytes>,
     }
 
-    #[allow(unreachable_pub)] // fuzzing only
+    #[allow(unnameable_types, unreachable_pub)] // fuzzing only
     #[derive(Clone)]
     pub struct Closed {
         pub(super) reason: Close,
@@ -4025,14 +4209,20 @@ mod state {
 
 /// Events of interest to the application
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Event {
     /// The connection's handshake data is ready
     HandshakeDataReady,
     /// The connection was successfully established
     Connected,
+    /// The TLS handshake was confirmed
+    HandshakeConfirmed,
     /// The connection was lost
     ///
-    /// Emitted if the peer closes the connection or an error is encountered.
+    /// Emitted when the connection is closed due to an error, a timeout, or the peer closing it.
+    /// This is **not** emitted when the local application closes the connection via
+    /// [`Connection::close()`](crate::Connection::close). In that case, pending operations will
+    /// fail with [`ConnectionError::LocallyClosed`].
     ConnectionLost {
         /// Reason that the connection was closed
         reason: ConnectionError,
@@ -4043,6 +4233,8 @@ pub enum Event {
     DatagramReceived,
     /// One or more application datagrams have been sent after blocking
     DatagramsUnblocked,
+    /// The currently active path was updated
+    PathUpdated,
 }
 
 fn get_max_ack_delay(params: &TransportParameters) -> Duration {
@@ -4051,6 +4243,17 @@ fn get_max_ack_delay(params: &TransportParameters) -> Duration {
 
 // Prevents overflow and improves behavior in extreme circumstances
 const MAX_BACKOFF_EXPONENT: u32 = 16;
+
+/// Maximum number of 1-RTT packets buffered while the handshake completes
+const MAX_EARLY_1RTT_PACKETS: usize = 16;
+
+/// An authenticated 1-RTT packet received before the handshake completed
+struct EarlyPacket {
+    remote: SocketAddr,
+    ecn: Option<EcnCodepoint>,
+    number: u64,
+    packet: Packet,
+}
 
 /// Minimal remaining size to allow packet coalescing, excluding cryptographic tag
 ///
@@ -4135,7 +4338,7 @@ mod tests {
                 .token_store
                 .insert("localhost", vec![0; token_len].into());
             let mut endpoint =
-                crate::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+                crate::Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
             let now = Instant::now();
             let (_, mut conn) = endpoint
                 .connect(
@@ -4145,9 +4348,7 @@ mod tests {
                     "localhost",
                 )
                 .unwrap();
-            let keys = conn
-                .crypto
-                .initial_keys(&conn.initial_dst_cid, Side::Server);
+            let keys = conn.crypto.initial_keys(conn.initial_dst_cid, Side::Server);
             let space = &mut conn.spaces[SpaceId::Initial];
             for pn in (0..32).step_by(2) {
                 space.pending_acks.insert_one(pn, now);

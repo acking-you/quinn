@@ -307,11 +307,12 @@ impl From<UnexpectedEnd> for Error {
 impl TransportParameters {
     /// Encode `TransportParameters` into buffer
     pub fn write<W: BufMut>(&self, w: &mut W) {
-        for idx in self
-            .write_order
-            .as_ref()
-            .unwrap_or(&std::array::from_fn(|i| i as u8))
-        {
+        let ids = match &self.write_order {
+            Some(order) => order,
+            None => &std::array::from_fn(|i| i as u8),
+        };
+
+        for idx in ids {
             let id = TransportParameterId::SUPPORTED[*idx as usize];
             match id {
                 TransportParameterId::ReservedTransportParameter => {
@@ -320,10 +321,10 @@ impl TransportParameters {
                     }
                 }
                 TransportParameterId::StatelessResetToken => {
-                    if let Some(ref x) = self.stateless_reset_token {
+                    if let Some(x) = self.stateless_reset_token {
                         w.write_var(id as u64);
                         w.write_var(16);
-                        w.put_slice(x);
+                        w.put_slice(&x);
                     }
                 }
                 TransportParameterId::DisableActiveMigration => {
@@ -340,31 +341,31 @@ impl TransportParameters {
                     }
                 }
                 TransportParameterId::PreferredAddress => {
-                    if let Some(ref x) = self.preferred_address {
+                    if let Some(x) = self.preferred_address {
                         w.write_var(id as u64);
                         w.write_var(x.wire_size() as u64);
                         x.write(w);
                     }
                 }
                 TransportParameterId::OriginalDestinationConnectionId => {
-                    if let Some(ref cid) = self.original_dst_cid {
+                    if let Some(cid) = self.original_dst_cid {
                         w.write_var(id as u64);
                         w.write_var(cid.len() as u64);
-                        w.put_slice(cid);
+                        w.put_slice(&cid);
                     }
                 }
                 TransportParameterId::InitialSourceConnectionId => {
-                    if let Some(ref cid) = self.initial_src_cid {
+                    if let Some(cid) = self.initial_src_cid {
                         w.write_var(id as u64);
                         w.write_var(cid.len() as u64);
-                        w.put_slice(cid);
+                        w.put_slice(&cid);
                     }
                 }
                 TransportParameterId::RetrySourceConnectionId => {
-                    if let Some(ref cid) = self.retry_src_cid {
+                    if let Some(cid) = self.retry_src_cid {
                         w.write_var(id as u64);
                         w.write_var(cid.len() as u64);
-                        w.put_slice(cid);
+                        w.put_slice(&cid);
                     }
                 }
                 TransportParameterId::GreaseQuicBit => {
@@ -484,7 +485,7 @@ impl TransportParameters {
                             match id {
                                 $(TransportParameterId::$id => {
                                     let value = r.get::<VarInt>()?;
-                                    if len != value.size() || got.$name { return Err(Error::Malformed); }
+                                    if got.$name { return Err(Error::Malformed); }
                                     params.$name = value.into();
                                     got.$name = true;
                                 })*
@@ -673,7 +674,7 @@ impl TransportParameterId {
     ];
 }
 
-impl std::cmp::PartialEq<u64> for TransportParameterId {
+impl PartialEq<u64> for TransportParameterId {
     fn eq(&self, other: &u64) -> bool {
         *other == (*self as u64)
     }

@@ -7,12 +7,11 @@ use std::{
     net::{Ipv6Addr, SocketAddr, UdpSocket},
     ops::RangeFrom,
     str,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use assert_matches::assert_matches;
 use bytes::BytesMut;
-use lazy_static::lazy_static;
 use rustls::{
     KeyLogFile,
     client::WebPkiServerVerifier,
@@ -22,7 +21,7 @@ use tracing::{info_span, trace};
 
 use super::crypto::rustls::{QuicClientConfig, QuicServerConfig, configured_provider};
 use super::*;
-use crate::{Duration, Instant};
+use crate::{Accepting, Duration, Instant};
 
 pub(super) const DEFAULT_MTU: usize = 1452;
 
@@ -54,13 +53,8 @@ impl Pair {
     }
 
     pub(super) fn new(endpoint_config: Arc<EndpointConfig>, server_config: ServerConfig) -> Self {
-        let server = Endpoint::new(
-            endpoint_config.clone(),
-            Some(Arc::new(server_config)),
-            true,
-            None,
-        );
-        let client = Endpoint::new(endpoint_config, None, true, None);
+        let server = Endpoint::new(endpoint_config.clone(), Some(Arc::new(server_config)), true);
+        let client = Endpoint::new(endpoint_config, None, true);
 
         Self::new_from_endpoint(client, server)
     }
@@ -152,7 +146,7 @@ impl Pair {
                 self.spins += (spin == self.last_spin) as u64;
                 self.last_spin = spin;
             }
-            if let Some(ref socket) = self.client.socket {
+            if let Some(socket) = &self.client.socket {
                 socket.send_to(&buffer, packet.destination).unwrap();
             }
             if self.server.addr == packet.destination {
@@ -176,7 +170,7 @@ impl Pair {
                 info!(packet_size, "dropping packet (max size exceeded)");
                 continue;
             }
-            if let Some(ref socket) = self.server.socket {
+            if let Some(socket) = &self.server.socket {
                 socket.send_to(&buffer, packet.destination).unwrap();
             }
             if self.client.addr == packet.destination {
@@ -237,7 +231,15 @@ impl Pair {
         );
         assert_matches!(
             self.server_conn_mut(server_ch).poll(),
+            Some(Event::HandshakeConfirmed)
+        );
+        assert_matches!(
+            self.server_conn_mut(server_ch).poll(),
             Some(Event::Connected)
+        );
+        assert_matches!(
+            self.client_conn_mut(client_ch).poll(),
+            Some(Event::HandshakeConfirmed)
         );
     }
 
@@ -356,7 +358,7 @@ impl TestEndpoint {
     }
 
     pub(super) fn drive_incoming(&mut self, now: Instant, remote: SocketAddr) {
-        if let Some(ref socket) = self.socket {
+        if let Some(socket) = &self.socket {
             loop {
                 let mut buf = [0; 8192];
                 if socket.recv_from(&mut buf).is_err() {
@@ -442,10 +444,10 @@ impl TestEndpoint {
             }
 
             for (ch, event) in endpoint_events {
-                if let Some(event) = self.handle_event(ch, event) {
-                    if let Some(conn) = self.connections.get_mut(&ch) {
-                        conn.handle_event(event);
-                    }
+                if let Some(event) = self.handle_event(ch, event)
+                    && let Some(conn) = self.connections.get_mut(&ch)
+                {
+                    conn.handle_event(event);
                 }
             }
         }
@@ -490,6 +492,38 @@ impl TestEndpoint {
                 Err(error.cause)
             }
         }
+    }
+
+    pub(super) fn pop_waiting_incoming(&mut self) -> Incoming {
+        let incoming = self.waiting_incoming.pop().unwrap();
+        assert!(self.waiting_incoming.is_empty());
+        incoming
+    }
+
+    pub(super) fn start_split_accept(&mut self, incoming: Incoming, now: Instant) -> Accepting {
+        let mut buf = Vec::new();
+        self.endpoint
+            .start_accept(incoming, now, &mut buf, None)
+            .unwrap()
+    }
+
+    pub(super) fn finish_split_accept(&mut self, accepting: Accepting) -> ConnectionHandle {
+        let mut buf = Vec::new();
+        let (ch, conn) = self
+            .endpoint
+            .finish_accept(accepting.accept(), &mut buf)
+            .expect("split accept unexpectedly failed");
+        self.connections.insert(ch, conn);
+        ch
+    }
+
+    /// Like `finish_split_accept`, but expects the handshake to fail, returning the cause
+    pub(super) fn finish_split_accept_error(&mut self, accepting: Accepting) -> ConnectionError {
+        let mut buf = Vec::new();
+        let Err(error) = self.endpoint.finish_accept(accepting.accept(), &mut buf) else {
+            panic!("split accept unexpectedly succeeded")
+        };
+        error.cause
     }
 
     pub(super) fn retry(&mut self, incoming: Incoming) {
@@ -560,6 +594,23 @@ impl Write for TestWriter {
     }
     fn flush(&mut self) -> io::Result<()> {
         io::stdout().flush()
+    }
+}
+
+/// A writer whose output can be read back, e.g. to inspect a qlog trace
+#[cfg(feature = "qlog")]
+#[derive(Clone, Default)]
+pub(super) struct SharedBuffer(pub(super) Arc<Mutex<Vec<u8>>>);
+
+#[cfg(feature = "qlog")]
+impl Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -648,7 +699,7 @@ fn client_crypto_inner(
     certs: Option<Vec<CertificateDer<'static>>>,
     alpn: Option<Vec<Vec<u8>>>,
 ) -> QuicClientConfig {
-    let mut roots = rustls::RootCertStore::empty();
+    let mut roots = RootCertStore::empty();
     for cert in certs.unwrap_or_else(|| vec![CERTIFIED_KEY.cert.der().clone()]) {
         roots.add(cert).unwrap();
     }
@@ -680,9 +731,8 @@ const MAX_DATAGRAMS: usize = 10;
 
 fn split_transmit(transmit: Transmit, buffer: &[u8]) -> Vec<(Transmit, Bytes)> {
     let mut buffer = Bytes::copy_from_slice(buffer);
-    let segment_size = match transmit.segment_size {
-        Some(segment_size) => segment_size,
-        _ => return vec![(transmit, buffer)],
+    let Some(segment_size) = transmit.segment_size else {
+        return vec![(transmit, buffer)];
     };
 
     let mut transmits = Vec::new();
@@ -723,12 +773,11 @@ fn set_congestion_experienced(
     })
 }
 
-lazy_static! {
-    pub static ref SERVER_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(4433..);
-    pub static ref CLIENT_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(44433..);
-    pub(crate) static ref CERTIFIED_KEY: rcgen::CertifiedKey<rcgen::KeyPair> =
-        rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-}
+static SERVER_PORTS: LazyLock<Mutex<RangeFrom<u16>>> = LazyLock::new(|| Mutex::new(4433..));
+pub(crate) static CLIENT_PORTS: LazyLock<Mutex<RangeFrom<u16>>> =
+    LazyLock::new(|| Mutex::new(44433..));
+pub(crate) static CERTIFIED_KEY: LazyLock<rcgen::CertifiedKey<rcgen::KeyPair>> =
+    LazyLock::new(|| rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap());
 
 #[derive(Default)]
 struct SimpleTokenLog(Mutex<HashSet<u128>>);

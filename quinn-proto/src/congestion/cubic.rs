@@ -19,12 +19,27 @@ const C: f64 = 0.4;
 /// k, w_max are described in the RFC.
 #[derive(Debug, Default, Clone)]
 pub(super) struct State {
+    /// Time period that the cubic function takes to increase the window size to W_max.
     k: f64,
 
+    /// Congestion window size when the last congestion event occurred.
     w_max: f64,
 
-    // Store cwnd increment during congestion avoidance.
+    /// Congestion window increment stored during congestion avoidance.
     cwnd_inc: u64,
+
+    /// Maximum number of bytes in flight that may be sent.
+    window: u64,
+
+    /// Slow start threshold in bytes.
+    ///
+    /// When the congestion window is below ssthresh, the mode is slow start
+    /// and the window grows by the number of bytes acknowledged.
+    ssthresh: u64,
+
+    /// The time when QUIC first detects a loss, causing it to enter recovery. When a packet sent
+    /// after this time is acknowledged, QUIC exits recovery.
+    recovery_start_time: Option<Instant>,
 }
 
 /// CUBIC Functions.
@@ -39,7 +54,7 @@ impl State {
         (w_max * (1.0 - BETA_CUBIC) / C).cbrt()
     }
 
-    // W_cubic(t) = C * (t - K)^3 - w_max (Eq. 1)
+    // W_cubic(t) = C * (t - K)^3 + w_max (Eq. 1)
     fn w_cubic(&self, t: Duration, max_datagram_size: u64) -> f64 {
         let w_max = self.w_max / max_datagram_size as f64;
 
@@ -60,28 +75,24 @@ impl State {
 #[derive(Debug, Clone)]
 pub struct Cubic {
     config: Arc<CubicConfig>,
-    /// Maximum number of bytes in flight that may be sent.
-    window: u64,
-    /// Slow start threshold in bytes. When the congestion window is below ssthresh, the mode is
-    /// slow start and the window grows by the number of bytes acknowledged.
-    ssthresh: u64,
-    /// The time when QUIC first detects a loss, causing it to enter recovery. When a packet sent
-    /// after this time is acknowledged, QUIC exits recovery.
-    recovery_start_time: Option<Instant>,
-    cubic_state: State,
     current_mtu: u64,
+    state: State,
+    /// Copy of the controller state to restore when a spurious congestion event is detected.
+    pre_congestion_state: Option<State>,
 }
 
 impl Cubic {
     /// Construct a state using the given `config` and current time `now`
     pub fn new(config: Arc<CubicConfig>, _now: Instant, current_mtu: u16) -> Self {
         Self {
-            window: config.initial_window,
-            ssthresh: u64::MAX,
-            recovery_start_time: None,
-            config,
-            cubic_state: Default::default(),
+            state: State {
+                window: config.initial_window,
+                ssthresh: u64::MAX,
+                ..Default::default()
+            },
             current_mtu: current_mtu as u64,
+            pre_congestion_state: None,
+            config,
         }
     }
 
@@ -101,6 +112,7 @@ impl Controller for Cubic {
     ) {
         if app_limited
             || self
+                .state
                 .recovery_start_time
                 .map(|recovery_start_time| sent <= recovery_start_time)
                 .unwrap_or(false)
@@ -108,35 +120,35 @@ impl Controller for Cubic {
             return;
         }
 
-        if self.window < self.ssthresh {
+        if self.state.window < self.state.ssthresh {
             // Slow start
-            self.window += bytes;
+            self.state.window += bytes;
         } else {
             // Congestion avoidance.
             let ca_start_time;
 
-            match self.recovery_start_time {
+            match self.state.recovery_start_time {
                 Some(t) => ca_start_time = t,
                 None => {
                     // When we come here without congestion_event() triggered,
                     // initialize congestion_recovery_start_time, w_max and k.
                     ca_start_time = now;
-                    self.recovery_start_time = Some(now);
+                    self.state.recovery_start_time = Some(now);
 
-                    self.cubic_state.w_max = self.window as f64;
-                    self.cubic_state.k = 0.0;
+                    self.state.w_max = self.state.window as f64;
+                    self.state.k = 0.0;
                 }
             }
 
             let t = now - ca_start_time;
 
             // w_cubic(t + rtt)
-            let w_cubic = self.cubic_state.w_cubic(t + rtt.get(), self.current_mtu);
+            let w_cubic = self.state.w_cubic(t + rtt.get(), self.current_mtu);
 
             // w_est(t)
-            let w_est = self.cubic_state.w_est(t, rtt.get(), self.current_mtu);
+            let w_est = self.state.w_est(t, rtt.get(), self.current_mtu);
 
-            let mut cubic_cwnd = self.window;
+            let mut cubic_cwnd = self.state.window;
 
             if w_cubic < w_est {
                 // TCP friendly region.
@@ -152,14 +164,20 @@ impl Controller for Cubic {
             }
 
             // Update the increment and increase cwnd by MSS.
-            self.cubic_state.cwnd_inc += cubic_cwnd - self.window;
+            // Keep release builds from wrapping the retained credit.
+            self.state.cwnd_inc = self
+                .state
+                .cwnd_inc
+                .saturating_add(cubic_cwnd - self.state.window);
 
             // cwnd_inc can be more than 1 MSS in the late stage of max probing.
             // however RFC9002 §7.3.3 (Congestion Avoidance) limits
             // the increase of cwnd to 1 max_datagram_size per cwnd acknowledged.
-            if self.cubic_state.cwnd_inc >= self.current_mtu {
-                self.window += self.current_mtu;
-                self.cubic_state.cwnd_inc = 0;
+            // Keep the excess credit for later ACKs instead of discarding it.
+            // https://www.rfc-editor.org/rfc/rfc9002.html#section-7.3.3
+            if self.state.cwnd_inc >= self.current_mtu {
+                self.state.window += self.current_mtu;
+                self.state.cwnd_inc -= self.current_mtu;
             }
         }
     }
@@ -169,9 +187,11 @@ impl Controller for Cubic {
         now: Instant,
         sent: Instant,
         is_persistent_congestion: bool,
+        is_ecn: bool,
         _lost_bytes: u64,
     ) {
         if self
+            .state
             .recovery_start_time
             .map(|recovery_start_time| sent <= recovery_start_time)
             .unwrap_or(false)
@@ -179,55 +199,66 @@ impl Controller for Cubic {
             return;
         }
 
-        self.recovery_start_time = Some(now);
-        let window = self.window as f64;
+        // Save state in case this event ends up being spurious
+        if !is_ecn {
+            self.pre_congestion_state = Some(self.state.clone());
+        }
+
+        self.state.recovery_start_time = Some(now);
+        let window = self.state.window as f64;
 
         // Fast convergence lowers W_max first; the 0.7 loss reduction still
         // applies to the old window, not to that already-reduced W_max.
         // https://www.rfc-editor.org/rfc/rfc9438.html#section-4.7
         // https://www.rfc-editor.org/rfc/rfc9438.html#section-4.6
-        if window < self.cubic_state.w_max {
-            self.cubic_state.w_max = window * (1.0 + BETA_CUBIC) / 2.0;
+        if window < self.state.w_max {
+            self.state.w_max = window * (1.0 + BETA_CUBIC) / 2.0;
         } else {
-            self.cubic_state.w_max = window;
+            self.state.w_max = window;
         }
 
-        self.ssthresh = cmp::max((window * BETA_CUBIC) as u64, self.minimum_window());
-        self.window = self.ssthresh;
-        self.cubic_state.k = self.cubic_state.cubic_k(self.current_mtu);
+        self.state.ssthresh = cmp::max((window * BETA_CUBIC) as u64, self.minimum_window());
+        self.state.window = self.state.ssthresh;
+        self.state.k = self.state.cubic_k(self.current_mtu);
 
-        self.cubic_state.cwnd_inc = (self.cubic_state.cwnd_inc as f64 * BETA_CUBIC) as u64;
+        self.state.cwnd_inc = (self.state.cwnd_inc as f64 * BETA_CUBIC) as u64;
 
         if is_persistent_congestion {
-            self.recovery_start_time = None;
-            self.cubic_state.w_max = self.window as f64;
+            // ssthresh already carries the single β_cubic reduction of the pre-event window
+            // applied above; RFC 9438 §4.8 (Timeout) requires no further reduction of ssthresh,
+            // only cwnd lowered to the minimum window.
+            self.state.recovery_start_time = None;
+            self.state.w_max = self.state.window as f64;
 
-            // 4.7 Timeout - reduce ssthresh based on BETA_CUBIC
-            self.ssthresh = cmp::max(
-                (self.window as f64 * BETA_CUBIC) as u64,
-                self.minimum_window(),
-            );
+            self.state.cwnd_inc = 0;
 
-            self.cubic_state.cwnd_inc = 0;
+            self.state.window = self.minimum_window();
+        }
+    }
 
-            self.window = self.minimum_window();
+    fn on_spurious_congestion_event(&mut self) {
+        if let Some(prior_state) = self.pre_congestion_state.take()
+            && self.state.window < prior_state.window
+        {
+            self.state = prior_state;
         }
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
         self.current_mtu = new_mtu as u64;
-        self.window = self.window.max(self.minimum_window());
+        self.state.window = self.state.window.max(self.minimum_window());
     }
 
     fn window(&self) -> u64 {
-        self.window
+        self.state.window
     }
 
     fn metrics(&self) -> super::ControllerMetrics {
         super::ControllerMetrics {
             congestion_window: self.window(),
-            ssthresh: Some(self.ssthresh),
+            ssthresh: Some(self.state.ssthresh),
             pacing_rate: None,
+            bandwidth_estimate: None,
         }
     }
 
@@ -273,7 +304,6 @@ impl ControllerFactory for CubicConfig {
         Box::new(Cubic::new(self, now, current_mtu))
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,18 +315,65 @@ mod tests {
         let mut cubic = Cubic::new(config, now, BASE_DATAGRAM_SIZE as u16);
         let window = 8 * BASE_DATAGRAM_SIZE;
 
-        cubic.window = window;
-        cubic.ssthresh = window;
-        cubic.cubic_state.w_max = 12.0 * BASE_DATAGRAM_SIZE as f64;
+        cubic.state.window = window;
+        cubic.state.ssthresh = window;
+        cubic.state.w_max = 12.0 * BASE_DATAGRAM_SIZE as f64;
 
-        cubic.on_congestion_event(now, now + Duration::from_millis(1), false, 0);
+        cubic.on_congestion_event(now, now + Duration::from_millis(1), false, false, 0);
 
-        assert_eq!(
-            cubic.cubic_state.w_max,
-            window as f64 * (1.0 + BETA_CUBIC) / 2.0
+        assert_eq!(cubic.state.w_max, window as f64 * (1.0 + BETA_CUBIC) / 2.0);
+        assert_eq!(cubic.state.ssthresh, (window as f64 * BETA_CUBIC) as u64);
+        assert_eq!(cubic.state.window, cubic.state.ssthresh);
+    }
+
+    #[test]
+    fn persistent_congestion_does_not_double_reduce_ssthresh() {
+        let now = Instant::now();
+        let config = Arc::new(CubicConfig::default());
+        let mut cubic = Cubic::new(config, now, BASE_DATAGRAM_SIZE as u16);
+        let window = 8 * BASE_DATAGRAM_SIZE;
+
+        cubic.state.window = window;
+        cubic.state.ssthresh = window;
+        cubic.state.w_max = window as f64;
+
+        cubic.on_congestion_event(now, now + Duration::from_millis(1), true, false, 0);
+
+        // RFC 9438 §4.8 (Timeout): ssthresh is the pre-event window reduced by β_cubic
+        // exactly once, as in §4.6; only cwnd is lowered to the minimum window.
+        assert_eq!(cubic.state.ssthresh, (window as f64 * BETA_CUBIC) as u64);
+        assert_eq!(cubic.state.window, 2 * BASE_DATAGRAM_SIZE);
+    }
+
+    #[test]
+    fn congestion_avoidance_preserves_excess_cwnd_increment() {
+        let now = Instant::now();
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let config = Arc::new(CubicConfig::default());
+        let mut cubic = Cubic::new(config, now, BASE_DATAGRAM_SIZE as u16);
+
+        // Put CUBIC directly into congestion avoidance.
+        cubic.state.ssthresh = cubic.state.window;
+        cubic.state.recovery_start_time = Some(now);
+        cubic.state.w_max = cubic.state.window as f64;
+
+        // Simulate accumulated credit from earlier ACKs. One ACK may only grow
+        // the window by one MTU, but the extra credit must remain for later ACKs.
+        cubic.state.cwnd_inc = 2 * BASE_DATAGRAM_SIZE + 1;
+        let window = cubic.state.window;
+
+        cubic.on_ack(
+            now,
+            now + Duration::from_millis(1),
+            BASE_DATAGRAM_SIZE,
+            false,
+            &rtt,
         );
-        assert_eq!(cubic.ssthresh, (window as f64 * BETA_CUBIC) as u64);
-        assert_eq!(cubic.window, cubic.ssthresh);
+
+        // Before this fix, the window grew by one MTU and the remainder was
+        // reset to zero.
+        assert_eq!(cubic.state.window, window + BASE_DATAGRAM_SIZE);
+        assert_eq!(cubic.state.cwnd_inc, BASE_DATAGRAM_SIZE + 1);
     }
 
     #[test]
@@ -307,15 +384,15 @@ mod tests {
         let mut cubic = Cubic::new(config, now, BASE_DATAGRAM_SIZE as u16);
 
         // Put CUBIC directly into congestion avoidance.
-        cubic.ssthresh = cubic.window;
-        cubic.recovery_start_time = Some(now);
-        let window = cubic.window;
+        cubic.state.ssthresh = cubic.state.window;
+        cubic.state.recovery_start_time = Some(now);
+        let window = cubic.state.window;
 
         // After ten days without a congestion event, w_cubic exceeds u64::MAX.
         // Before this fix, computing the window increment overflowed.
         let later = now + Duration::from_secs(10 * 24 * 60 * 60);
         cubic.on_ack(later, later, BASE_DATAGRAM_SIZE, false, &rtt);
 
-        assert_eq!(cubic.window, window + BASE_DATAGRAM_SIZE);
+        assert_eq!(cubic.state.window, window + BASE_DATAGRAM_SIZE);
     }
 }

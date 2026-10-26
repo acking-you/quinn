@@ -2,10 +2,8 @@
 
 use std::io::Cursor;
 
-use bytes::BytesMut;
-
 use super::*;
-use crate::packet::{FixedLengthConnectionIdParser, Header, ProtectedHeader};
+use crate::packet::{FixedLengthConnectionIdParser, ProtectedHeader};
 
 #[test]
 fn oversized_cached_initial_token() {
@@ -29,7 +27,7 @@ fn oversized_cached_initial_token() {
         config
             .token_store
             .insert("localhost", vec![0; token_len].into());
-        let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+        let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
         let now = Instant::now();
         let (_, mut conn) = endpoint
             .connect(now, config, "[::1]:4433".parse().unwrap(), "localhost")
@@ -67,17 +65,15 @@ fn oversized_retry_token() {
         (1200, false),
     ] {
         let address = "[::1]:4433".parse().unwrap();
-        let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+        let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
         let now = Instant::now();
         let (_, mut conn) = endpoint
             .connect(now, client_config(), address, "localhost")
             .unwrap();
         let mut buf = Vec::new();
         let _ = conn.poll_transmit(now, 1, &mut buf).unwrap();
-        let mut bytes = BytesMut::new();
-        bytes.extend_from_slice(&buf);
         let ProtectedHeader::Initial(initial) = ProtectedHeader::decode(
-            &mut Cursor::new(bytes),
+            &mut Cursor::new(&buf),
             &FixedLengthConnectionIdParser::new(0),
             DEFAULT_SUPPORTED_VERSIONS,
             false,
@@ -95,7 +91,7 @@ fn oversized_retry_token() {
         retry.resize(retry.len() + token_len, 0);
         let tag = server_config()
             .crypto
-            .retry_tag(initial.version, &initial.dst_cid, &retry);
+            .retry_tag(initial.version, initial.dst_cid, &retry);
         retry.extend_from_slice(&tag);
         let Some(DatagramEvent::ConnectionEvent(_, event)) = endpoint.handle(
             now,
