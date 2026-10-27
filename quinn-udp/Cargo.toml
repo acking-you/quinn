@@ -1,11 +1,11 @@
 [package]
-name = "quinn-udp"
+name = "quinn-udp-plus"
 version = "0.6.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "UDP sockets with ECN information for the QUIC transport protocol"
+description = "UDP sockets with ECN information for the QUIC transport protocol (the fork pb-mapper pins, published as quinn-udp-plus)"
 keywords.workspace = true
 categories.workspace = true
 workspace = ".."
@@ -41,6 +41,8 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net"] }
 cfg_aliases = { workspace = true }
 
 [lib]
+# Published as quinn-udp-plus; code keeps importing it as `quinn_udp`.
+name = "quinn_udp"
 # See https://github.com/bheisler/criterion.rs/blob/master/book/src/faq.md#cargo-bench-gives-unrecognized-option-errors-for-valid-command-line-options
 bench = false
 

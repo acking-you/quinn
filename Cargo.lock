@@ -386,7 +386,7 @@ dependencies = [
  "bytes",
  "clap",
  "hdrhistogram",
- "quinn",
+ "quinn-plus",
  "rcgen",
  "rustls",
  "tokio",
@@ -453,7 +453,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
- "quinn",
+ "quinn-plus",
  "rcgen",
  "rustls",
 ]
@@ -1060,7 +1060,7 @@ version = "0.1.0"
 dependencies = [
  "arbitrary",
  "libfuzzer-sys",
- "quinn-proto",
+ "quinn-proto-plus",
 ]
 
 [[package]]
@@ -1803,8 +1803,8 @@ dependencies = [
  "clap",
  "console-subscriber",
  "hdrhistogram",
- "quinn",
- "quinn-proto",
+ "quinn-plus",
+ "quinn-proto-plus",
  "rcgen",
  "rustls",
  "serde",
@@ -1957,7 +1957,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quinn"
+name = "quinn-plus"
 version = "0.12.0"
 dependencies = [
  "anyhow",
@@ -1971,8 +1971,8 @@ dependencies = [
  "futures-io",
  "parking_lot",
  "pin-project-lite",
- "quinn-proto",
- "quinn-udp",
+ "quinn-proto-plus",
+ "quinn-udp-plus",
  "rand",
  "rcgen",
  "rustc-hash",
@@ -1988,7 +1988,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quinn-proto"
+name = "quinn-proto-plus"
 version = "0.12.0"
 dependencies = [
  "arbitrary",
@@ -2018,7 +2018,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quinn-udp"
+name = "quinn-udp-plus"
 version = "0.6.3"
 dependencies = [
  "cfg_aliases",
@@ -2028,7 +2028,7 @@ dependencies = [
  "socket2",
  "tokio",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

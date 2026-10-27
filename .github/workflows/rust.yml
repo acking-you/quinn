@@ -37,7 +37,7 @@ jobs:
             echo "===== freebsd-version ====="
             freebsd-version
 
-            cargo build --locked --all-targets && cargo test --locked && cargo test --locked -- --ignored stress && cargo test --locked --manifest-path fuzz/Cargo.toml && cargo test --locked -p quinn-udp --benches
+            cargo build --locked --all-targets && cargo test --locked && cargo test --locked -- --ignored stress && cargo test --locked --manifest-path fuzz/Cargo.toml && cargo test --locked -p quinn-udp-plus --benches
 
   test-solaris:
     name: test on solaris
@@ -62,7 +62,7 @@ jobs:
             export PATH=$HOME/.rust_solaris/bin:$PATH
             # Workaround for https://github.com/quinn-rs/quinn/issues/2218
             export CARGO_HTTP_MULTIPLEXING=false
-            cargo build --locked --all-targets && cargo test --locked --manifest-path fuzz/Cargo.toml && cargo test --locked -p quinn-udp --benches
+            cargo build --locked --all-targets && cargo test --locked --manifest-path fuzz/Cargo.toml && cargo test --locked -p quinn-udp-plus --benches
 
   test-illumos:
     name: test on illumos
@@ -80,7 +80,7 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           run: |
             . "$HOME/.cargo/env"
-            cargo build --locked --all-targets && cargo test --locked && cargo test --locked -- --ignored stress && cargo test --locked --manifest-path fuzz/Cargo.toml && cargo test --locked -p quinn-udp --benches
+            cargo build --locked --all-targets && cargo test --locked && cargo test --locked -- --ignored stress && cargo test --locked --manifest-path fuzz/Cargo.toml && cargo test --locked -p quinn-udp-plus --benches
 
   test-musl:
     name: test on musl
@@ -95,7 +95,7 @@ jobs:
           target: x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p quinn-udp --target x86_64-unknown-linux-musl
+      - run: cargo test --locked -p quinn-udp-plus --target x86_64-unknown-linux-musl
 
   test:
     strategy:
@@ -118,13 +118,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --all-targets
       - run: cargo test --locked
-      - run: cargo test --locked -p quinn-udp --features fast-apple-datapath
+      - run: cargo test --locked -p quinn-udp-plus --features fast-apple-datapath
         if: ${{ runner.os == 'macOS' }}
       - run: cargo test --locked -- --ignored stress
       - run: cargo test --locked --manifest-path fuzz/Cargo.toml
         if: ${{ matrix.rust == 'stable' }}
-      - run: cargo test --locked -p quinn-udp --benches
-      - run: cargo test --locked -p quinn-udp --benches --features fast-apple-datapath
+      - run: cargo test --locked -p quinn-udp-plus --benches
+      - run: cargo test --locked -p quinn-udp-plus --benches --features fast-apple-datapath
         if: ${{ runner.os == 'macOS' }}
 
   test-aws-lc-rs:
@@ -156,13 +156,13 @@ jobs:
       - uses: bytecodealliance/actions/wasmtime/setup@v1
       - uses: cargo-bins/cargo-binstall@main
 
-      - run: cargo test --locked -p quinn-proto --target wasm32-unknown-unknown --no-run
-      - run: cargo check --locked -p quinn-udp --target wasm32-unknown-unknown --no-default-features --features=tracing,log
+      - run: cargo test --locked -p quinn-proto-plus --target wasm32-unknown-unknown --no-run
+      - run: cargo check --locked -p quinn-udp-plus --target wasm32-unknown-unknown --no-default-features --features=tracing,log
       # Unlike wasm32-unknown-unknown, wasip2 has real sockets, so `wasi.rs` can be tested.
-      - run: cargo test --locked -p quinn-udp --target wasm32-wasip2 --tests
+      - run: cargo test --locked -p quinn-udp-plus --target wasm32-wasip2 --tests
         env:
           CARGO_TARGET_WASM32_WASIP2_RUNNER: wasmtime run -S inherit-network
-      - run: cargo rustc --locked -p quinn --target wasm32-unknown-unknown --no-default-features --features=tracing-log,platform-verifier,rustls-ring --crate-type=cdylib
+      - run: cargo rustc --locked -p quinn-plus --target wasm32-unknown-unknown --no-default-features --features=tracing-log,platform-verifier,rustls-ring --crate-type=cdylib
 
       # If the Wasm file contains any 'import "env"' declarations, then
       # some non-Wasm-compatible code made it into the final code.
@@ -175,7 +175,7 @@ jobs:
 
       # Match the version of wasm-bindgen used in `Cargo.lock`
       - run: cargo binstall wasm-bindgen-cli@0.2.128 --locked --no-confirm
-      - run: cargo test --locked -p quinn-proto --target wasm32-unknown-unknown
+      - run: cargo test --locked -p quinn-proto-plus --target wasm32-unknown-unknown
 
   msrv:
     runs-on: ubuntu-latest
@@ -184,7 +184,7 @@ jobs:
       # Note that we must also update the README when changing the MSRV
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --lib --all-features -p quinn-udp -p quinn-proto -p quinn
+      - run: cargo check --locked --lib --all-features -p quinn-udp-plus -p quinn-proto-plus -p quinn-plus
 
   lint:
     runs-on: ubuntu-latest
@@ -227,8 +227,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: |
           for target in aarch64-apple-ios aarch64-apple-ios-sim aarch64-linux-android; do
-            cargo clippy --locked -p quinn-udp --lib --target "$target" -- -D warnings
-            cargo clippy --locked -p quinn-udp --lib --target "$target" --all-features -- -D warnings
+            cargo clippy --locked -p quinn-udp-plus --lib --target "$target" -- -D warnings
+            cargo clippy --locked -p quinn-udp-plus --lib --target "$target" --all-features -- -D warnings
           done
 
   test-android:
@@ -328,9 +328,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Only socket-free tests can run under Miri; these exercise the pointer handling in the
       # cmsg helpers, which the socket-based tests never reach in an interpreter.
-      - run: cargo miri test --locked -p quinn-udp --lib -- cmsg::tests linux::tests
+      - run: cargo miri test --locked -p quinn-udp-plus --lib -- cmsg::tests linux::tests
         env:
           MIRIFLAGS: ${{ matrix.flags }}
-      - run: cargo miri test --locked -p quinn-udp --lib -- cmsg::tests linux::tests
+      - run: cargo miri test --locked -p quinn-udp-plus --lib -- cmsg::tests linux::tests
         env:
           MIRIFLAGS: ${{ matrix.flags }} -Zmiri-tree-borrows
